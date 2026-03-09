@@ -1,0 +1,45 @@
+# Build directories
+build/
+build-*
+out/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Dependencies
+lib/
+deps/
+node_modules/
+
+# Temporary files
+tmp/
+temp/
+
+# Coverage reports
+coverage/
+.coverage
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test outputs
+*.test
+*.out
+
+# CCache
+ccache/
+
