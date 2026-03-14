@@ -1,5 +1,7 @@
 # vvar
 
+![CI](https://github.com/hypernewbie/vvar/actions/workflows/ci.yml/badge.svg)
+
 A modern C++17 port of the Quake III Arena cvar and command system, extracted as a lightweight, header-friendly library. If you know what a cvar is, you know what this does.
 
 ## What's included
