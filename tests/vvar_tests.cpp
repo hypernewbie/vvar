@@ -2,14 +2,26 @@
 #define UTEST_USE_COLORS 1
 #include "utest.h"
 
+#include <cstdio>
+#include <fstream>
+#include <string>
+#include <type_traits>
+
 #include "vvar_test_stubs.h"
 #include "../vvar.h"
 #include "../vvar_impl.h"
 
 // Test helpers
 static void resetVvarForTest() {
+    vvarTestClearLog();
     veCVar::init();
     veCmd_InitDefaultFunctions();
+    veGetCmd().getAliases().clear();
+    veGetCmd().setWait(0);
+}
+
+static bool logContains(const char* text) {
+    return vvarTestGetLog().find(text) != std::string::npos;
 }
 
 // ======================= Utility Functions Tests =======================
@@ -173,6 +185,33 @@ UTEST(veIVar, multiple_keys) {
     EXPECT_STREQ("sword", veIVar::get("weapon", "primary"));
 }
 
+UTEST(veIVar, to_string) {
+    resetVvarForTest();
+    veIVar::set("player", "name", "hero");
+    veIVar::set("player", "rate", "25000");
+    std::string info = veIVar::toString("player");
+    EXPECT_TRUE(info.find("\\name\\hero") != std::string::npos);
+    EXPECT_TRUE(info.find("\\rate\\25000") != std::string::npos);
+}
+
+UTEST(veIVar, from_string_round_trip) {
+    resetVvarForTest();
+    veIVar::fromString("player", "\\name\\hero\\rate\\25000");
+    EXPECT_STREQ("hero", veIVar::get("player", "name"));
+    EXPECT_STREQ("25000", veIVar::get("player", "rate"));
+    std::string info = veIVar::toString("player");
+    EXPECT_TRUE(info.find("\\name\\hero") != std::string::npos);
+    EXPECT_TRUE(info.find("\\rate\\25000") != std::string::npos);
+}
+
+UTEST(veIVar, from_string_clears_existing_section) {
+    resetVvarForTest();
+    veIVar::set("player", "old", "value");
+    veIVar::fromString("player", "\\name\\hero");
+    EXPECT_EQ(veIVar::get("player", "old"), nullptr);
+    EXPECT_STREQ("hero", veIVar::get("player", "name"));
+}
+
 // ======================= veCVar Tests =======================
 
 UTEST(veCVar, get_create_new) {
@@ -191,6 +230,17 @@ UTEST(veCVar, get_existing) {
     EXPECT_EQ(cv1, cv2);
 }
 
+UTEST(veCVarRef, resolves_lazily) {
+    resetVvarForTest();
+    veCVarRef ref("lazy_ref_test", "17", VE_CVAR_ARCHIVE);
+    EXPECT_EQ(veCVar::find("lazy_ref_test"), nullptr);
+    veCVar* resolved = ref.get();
+    ASSERT_NE(resolved, nullptr);
+    EXPECT_EQ(resolved, ref.get());
+    EXPECT_STREQ("17", veCVar::variableString("lazy_ref_test"));
+    EXPECT_TRUE(resolved->getFlags() & VE_CVAR_ARCHIVE);
+}
+
 UTEST(veCVar, get_null_parameters) {
     resetVvarForTest();
     // Should not crash with null parameters
@@ -204,6 +254,14 @@ UTEST(veCVar, set_value) {
     veCVar::get("test_var", "initial", 0);
     veCVar::set("test_var", "new_value");
     EXPECT_STREQ("new_value", veCVar::variableString("test_var"));
+}
+
+UTEST(veCVar, getBool) {
+    resetVvarForTest();
+    veCVar* cv = veCVar::get("bool_test", "1", 0);
+    EXPECT_TRUE(cv->getBool());
+    veCVar::set("bool_test", "0");
+    EXPECT_FALSE(cv->getBool());
 }
 
 UTEST(veCVar, set2_force) {
@@ -295,6 +353,9 @@ UTEST(veCVar, reset_to_default) {
 UTEST(veCVar, forceReset) {
     resetVvarForTest();
     veCVar::get("test_force", "default", VE_CVAR_ROM);
+    veCVar::set2("test_force", "modified", true);
+    veCVar::reset("test_force");
+    EXPECT_STREQ("modified", veCVar::variableString("test_force"));
     veCVar::forceReset("test_force");
     EXPECT_STREQ("default", veCVar::variableString("test_force"));
 }
@@ -383,6 +444,29 @@ UTEST(veCVar, command_seta_flag) {
     veCVar* cv = veCVar::find("seta_test");
     ASSERT_NE(cv, nullptr);
     EXPECT_TRUE(cv->getFlags() & VE_CVAR_ARCHIVE);
+}
+
+UTEST(veCmd, alias_executes_sequence) {
+    resetVvarForTest();
+    veGetCmd().executeString("alias jump \"echo one; echo two\"");
+    vvarTestClearLog();
+    veGetCmd().executeString("jump");
+    EXPECT_TRUE(logContains("one\n"));
+    EXPECT_TRUE(logContains("two\n"));
+}
+
+UTEST(veCmd, exec_runs_script_file) {
+    resetVvarForTest();
+    const char* fileName = "vvar_exec_test.cfg";
+    {
+        std::ofstream file(fileName, std::ios::trunc);
+        ASSERT_TRUE(file.good());
+        file << "set exec_test success\n";
+    }
+
+    veGetCmd().executeString("exec vvar_exec_test.cfg");
+    EXPECT_STREQ("success", veCVar::variableString("exec_test"));
+    std::remove(fileName);
 }
 
 // ======================= veCmd Tests =======================
@@ -678,9 +762,15 @@ UTEST(veCVar, getModifiedFlags) {
 UTEST(veCVar, updateFromIntegerFloatValues) {
     resetVvarForTest();
     veCVar* cv = veCVar::get("update_test", "5", VE_CVAR_ALLOW_SET_INTEGER);
-    // Test that setValue properly updates both integer and string
-    veCVar::setValue("update_test", 10.0f);
+    cv->getInteger() = 10;
+    veCVar::updateFromIntegerFloatValues();
     EXPECT_EQ(10, veCVar::variableIntegerValue("update_test"));
+    EXPECT_STREQ("10", veCVar::variableString("update_test"));
+
+    cv->getValue() = 2.5f;
+    veCVar::updateFromIntegerFloatValues();
+    EXPECT_NEAR(2.5f, veCVar::variableValue("update_test"), 0.001f);
+    EXPECT_STREQ("2.500000", veCVar::variableString("update_test"));
 }
 
 UTEST(veCmd, tokenizeStringIgnoreQuotes) {
@@ -723,10 +813,13 @@ UTEST(veCVar, print_modified_cvar) {
 
 UTEST(veCVar, list_modified) {
     resetVvarForTest();
+    veCVar::get("list_modified_clean", "default", 0);
     veCVar::get("list_modified_test", "default", 0);
     veCVar::set("list_modified_test", "modified");
+    vvarTestClearLog();
     veCVar::listModified();
-    SUCCEED();
+    EXPECT_TRUE(logContains("list_modified_test"));
+    EXPECT_FALSE(logContains("list_modified_clean"));
 }
 
 UTEST(veCmd, executeString_cvar_command) {
@@ -769,13 +862,17 @@ UTEST(veq3_va, multiple_calls) {
     EXPECT_STREQ("second 2", r2);
 }
 
+UTEST(veq3_va, nested_calls) {
+    resetVvarForTest();
+    char* result = veq3_va("outer %s", veq3_va("inner %d", 7));
+    EXPECT_STREQ("outer inner 7", result);
+}
+
 // ======================= veCVar Constructor/Destructor =======================
 
-UTEST(veCVar, constructor) {
+UTEST(veCVar, constructor_is_internal) {
     resetVvarForTest();
-    veCVar* cv = new veCVar();
-    ASSERT_NE(cv, nullptr);
-    delete cv;
+    EXPECT_FALSE((std::is_default_constructible_v<veCVar>));
 }
 
 // ======================= veCmd Constructor/Destructor =======================
@@ -793,7 +890,7 @@ UTEST(veCVar, many_variables) {
     resetVvarForTest();
     for (int i = 0; i < 100; i++) {
         char name[32];
-        sprintf_s(name, sizeof(name), "var_%d", i);
+        std::snprintf(name, sizeof(name), "var_%d", i);
         veCVar::get(name, "value", 0);
     }
     // Should handle 100 cvars without issues
@@ -806,7 +903,7 @@ UTEST(veCmd, many_commands) {
     resetVvarForTest();
     for (int i = 0; i < 100; i++) {
         char name[32];
-        sprintf_s(name, sizeof(name), "cmd_%d", i);
+        std::snprintf(name, sizeof(name), "cmd_%d", i);
         veGetCmd().addCommand(name, [](){});
     }
     // Should handle 100 commands without issues
@@ -851,7 +948,7 @@ UTEST(veCVar, modification_count) {
     int initialModCount = cv->getModificationCount();
     veCVar::set("mod_count_test", "modified1");
     veCVar::set("mod_count_test", "modified2");
-    EXPECT_TRUE(cv->getModificationCount() > initialModCount);
+    EXPECT_EQ(initialModCount + 2, cv->getModificationCount());
 }
 
 UTEST(veCVar, modified_flag) {

@@ -22,12 +22,62 @@
 */
 
 #pragma once
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <string>
 #include <functional>
 #include <vector>
 #include <memory>
 #include <unordered_map>
+
+#if !defined(VVAR_NO_DEFAULT_LOGGING)
+inline void vvar_default_vlog( FILE* stream, const char* format, va_list args )
+{
+	std::vfprintf( stream, format, args );
+}
+
+inline void vvar_default_dinfo( const char* format, ... )
+{
+	va_list args;
+	va_start( args, format );
+	vvar_default_vlog( stderr, format, args );
+	va_end( args );
+}
+
+inline void vvar_default_derr( const char* format, ... )
+{
+	va_list args;
+	va_start( args, format );
+	vvar_default_vlog( stderr, format, args );
+	va_end( args );
+}
+
+[[noreturn]] inline void vvar_default_derr_fatal( const char* format, ... )
+{
+	va_list args;
+	va_start( args, format );
+	vvar_default_vlog( stderr, format, args );
+	va_end( args );
+	std::fflush( stderr );
+	std::abort();
+}
+
+#ifndef dinfo
+#define dinfo(...) vvar_default_dinfo( __VA_ARGS__ )
+#endif
+
+#ifndef derr
+#define derr(...) vvar_default_derr( __VA_ARGS__ )
+#endif
+
+#ifndef derr_fatal
+#define derr_fatal(...) vvar_default_derr_fatal( __VA_ARGS__ )
+#endif
+#endif
 
 // Macro to disallow copy constructor and assignment operator
 #define DISALLOW_COPY(className) \
@@ -97,11 +147,14 @@ class veIVar
 	DISALLOW_COPY( veIVar )
 
 	static std::unordered_map< std::string, std::unordered_map< std::string, std::string > > m_globalIVarTable;
+	static thread_local std::string m_serializedInfoString;
 
 public:
 	static const char* get( const char *s, const char *key );
 	static void remove( const char *s, const char *key );
 	static void set( const char *s, const char *key, const char *value );
+	static const char* toString( const char *s );
+	static void fromString( const char *s, const char *infoString );
 };
 
 // ------------------------------------ Console Variables Definition ----------------------------------------
@@ -191,22 +244,24 @@ class veCVar
 	static std::map< std::string, std::unique_ptr< veCVar > > m_globalCVarTable;
 	static int m_modifiedFlags;
 
+private:
+	veCVar();
+
 protected:
 	static bool validateString( const char *s );
 	static const char* validate( veCVar *var, const char *value, bool warn );
 
 public:
-	veCVar();
 	virtual ~veCVar();
 
-	inline auto getModified()
+	inline auto getModified() const
 	{
 		return m_modified;
 	}
 
-	inline auto getModificationCount()
+	inline auto getModificationCount() const
 	{
-		return m_modified;
+		return m_modificationCount;
 	}
 
 	inline auto& getValue()
@@ -219,9 +274,9 @@ public:
 		return m_integer;
 	}
 
-	inline bool& getBool()
+	inline bool getBool() const
 	{
-		return *( reinterpret_cast< bool* >( &m_integer ) );
+		return m_integer != 0;
 	}
 
 	inline auto& getString()
@@ -318,6 +373,31 @@ public:
 	static void updateFromIntegerFloatValues();
 };
 
+// Resolve lazily after veCVar::init(); resolving before init() will cache a pointer that init() clears.
+class veCVarRef
+{
+	DISALLOW_COPY( veCVarRef )
+
+	const char*     m_name;
+	const char*     m_default;
+	int             m_flags;
+	mutable veCVar* m_resolved = nullptr;
+
+public:
+	veCVarRef( const char* name, const char* defaultValue, int flags )
+		: m_name( name ), m_default( defaultValue ), m_flags( flags ) {}
+
+	veCVar* operator->() const
+	{
+		if( !m_resolved )
+			m_resolved = veCVar::get( m_name, m_default, m_flags );
+		return m_resolved;
+	}
+
+	veCVar& operator*() const { return *operator->(); }
+	veCVar* get() const { return operator->(); }
+};
+
 extern veCVar* sv_cheats;
 
 // ------------------------------------------------- Console Commands ------------------------------------------------------------
@@ -362,6 +442,7 @@ class veCmd
 
 	// Possible commands to execute
 	std::unordered_map< std::string, veCmdFuncHandler > m_functions;
+	std::unordered_map< std::string, std::string > m_aliases;
 
 protected:
 	void execute();
@@ -416,6 +497,16 @@ public:
 	inline auto& getFunctionsList()
 	{
 		return m_functions;
+	}
+
+	inline auto& getAliases()
+	{
+		return m_aliases;
+	}
+
+	inline const auto& getAliases() const
+	{
+		return m_aliases;
 	}
 
 	inline void setWait( int wait )

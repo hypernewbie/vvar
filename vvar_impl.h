@@ -23,6 +23,9 @@
 
 #include "vvar.h"
 
+#include <array>
+#include <fstream>
+
 veCVar* sv_cheats = nullptr;
 std::unique_ptr< veCmd > g_cmd;
 
@@ -31,11 +34,41 @@ static std::string g_fieldCompletionString;
 static std::string g_fieldShortestMatch;
 static int g_fieldMatchCount;
 
+static bool veInfoStringValueIsValid( const std::string& value )
+{
+	return value.find( '\\' ) == std::string::npos
+		&& value.find( '"' ) == std::string::npos
+		&& value.find( ';' ) == std::string::npos;
+}
+
+static bool veIsValidConsoleToken( const char* value )
+{
+	return value && *value
+		&& strchr( value, '\\' ) == nullptr
+		&& strchr( value, '"' ) == nullptr
+		&& strchr( value, ';' ) == nullptr;
+}
+
+static void veCopyString( char* buffer, int bufsize, const char* value )
+{
+	if( !buffer || bufsize <= 0 ) {
+		return;
+	}
+
+	if( !value ) {
+		buffer[0] = '\0';
+		return;
+	}
+
+	std::snprintf( buffer, static_cast< size_t >( bufsize ), "%s", value );
+}
+
 // ------------------------------------ Key / value info strings ----------------------------------------
 
 // ref: ioq3 source code
 
 std::unordered_map< std::string, std::unordered_map< std::string, std::string > > veIVar::m_globalIVarTable;
+thread_local std::string veIVar::m_serializedInfoString;
 
 const char* veIVar::get( const char *s, const char *key )
 {
@@ -61,11 +94,81 @@ void veIVar::remove( const char *s, const char *key )
 		return;
 
 	itr->second.erase( itr2 );
+	if( itr->second.empty() ) {
+		m_globalIVarTable.erase( itr );
+	}
 }
 
 void veIVar::set( const char *s, const char *key, const char *value )
 {
 	m_globalIVarTable[s][key] = value;
+}
+
+const char* veIVar::toString( const char *s )
+{
+	m_serializedInfoString.clear();
+
+	auto itr = m_globalIVarTable.find( s ? s : "" );
+	if( itr == m_globalIVarTable.end() ) {
+		return "";
+	}
+
+	for( const auto& kv : itr->second ) {
+		if( !veInfoStringValueIsValid( kv.first ) || !veInfoStringValueIsValid( kv.second ) ) {
+			continue;
+		}
+
+		m_serializedInfoString += '\\';
+		m_serializedInfoString += kv.first;
+		m_serializedInfoString += '\\';
+		m_serializedInfoString += kv.second;
+	}
+
+	return m_serializedInfoString.c_str();
+}
+
+void veIVar::fromString( const char *s, const char *infoString )
+{
+	auto& section = m_globalIVarTable[s ? s : ""];
+	section.clear();
+
+	if( !infoString || !*infoString ) {
+		return;
+	}
+
+	auto cursor = infoString;
+	while( *cursor ) {
+		if( *cursor == '\\' ) {
+			cursor++;
+		}
+		if( !*cursor ) {
+			break;
+		}
+
+		const char* keyStart = cursor;
+		while( *cursor && *cursor != '\\' ) {
+			cursor++;
+		}
+		std::string key( keyStart, cursor - keyStart );
+		if( !*cursor ) {
+			break;
+		}
+
+		cursor++;
+		const char* valueStart = cursor;
+		while( *cursor && *cursor != '\\' ) {
+			cursor++;
+		}
+		std::string value( valueStart, cursor - valueStart );
+
+		if( !key.empty() && veInfoStringValueIsValid( key ) && veInfoStringValueIsValid( value ) ) {
+			section[key] = value;
+		}
+	}
+
+	if( section.empty() ) {
+		m_globalIVarTable.erase( s ? s : "" );
+	}
 }
 
 // ------------------------------------ Console Variables Implementation ----------------------------------------
@@ -211,22 +314,21 @@ const char* veCVar::validate( veCVar *var, const char *value, bool warn )
 
 	if( changed ) {
 		if( veIsIntegral( valuef ) ) {
-			sprintf_s( s, sizeof( s ), "%d", ( int ) valuef );
+			std::snprintf( s, sizeof( s ), "%d", ( int ) valuef );
 
 			if( warn )
 				derr( ", setting to %d\n", ( int ) valuef );
 		} else {
-			sprintf_s( s, sizeof( s ), "%f", valuef );
+			std::snprintf( s, sizeof( s ), "%f", valuef );
 
 			if( warn )
 				derr( ", setting to %f\n", valuef );
 		}
 
 		return s;
-	} else
+	} else {
 		return value;
-
-	return "";
+	}
 }
 
 veCVar* veCVar::find( const char *varName )
@@ -285,7 +387,7 @@ veCVar* veCVar::get( const char* varName, const char* value, int flags )
 	// Allocate a new cvar
 	//
 
-	m_globalCVarTable[varName] = std::make_unique< veCVar >();
+	m_globalCVarTable[varName] = std::unique_ptr< veCVar >( new veCVar() );
 	var = m_globalCVarTable[varName].get();
 	if( !var )
 		derr_fatal( "veCVar::get() Failed to allocate new cvar." );
@@ -346,7 +448,7 @@ void veCVar::listModified( const char* match )
 	int totalModified = 0;
 	for( auto& cv : m_globalCVarTable ) {
 		auto var = cv.second.get();
-		if( !var || !var->m_name.length() || var->m_modificationCount )
+		if( !var || !var->m_name.length() || !var->m_modificationCount )
 			continue;
 
 		auto& value = var->m_latchedString.length() ? var->m_latchedString : var->m_string;
@@ -473,9 +575,9 @@ void veCVar::setValue( const char *varName, float value )
 {
 	char val[128];
 	if( value == ( int ) value ) {
-		sprintf_s( val, sizeof( val ), "%i", ( int ) value );
+		std::snprintf( val, sizeof( val ), "%i", ( int ) value );
 	} else {
-		sprintf_s( val, sizeof( val ), "%f", value );
+		std::snprintf( val, sizeof( val ), "%f", value );
 	}
 	veCVar::set( varName, val );
 }
@@ -484,9 +586,9 @@ void veCVar::setValueSafe( const char *varName, float value )
 {
 	char val[128];
 	if( veIsIntegral( value ) )
-		sprintf_s( val, sizeof( val ), "%i", ( int ) value );
+		std::snprintf( val, sizeof( val ), "%i", ( int ) value );
 	else
-		sprintf_s( val, sizeof( val ), "%f", value );
+		std::snprintf( val, sizeof( val ), "%f", value );
 	veCVar::setSafe( varName, val );
 }
 
@@ -520,7 +622,7 @@ void veCVar::variableStringBuffer( const char *varName, char *buffer, int bufsiz
 	if( !var )
 		*buffer = 0;
 	else
-		strncpy_s( buffer, bufsize, var->m_string.c_str(), var->m_string.size() );
+		veCopyString( buffer, bufsize, var->m_string.c_str() );
 }
 
 int veCVar::flags( const char *varName )
@@ -545,7 +647,7 @@ void veCVar::commandCompletion( std::function< void( const char *s ) > callback 
 
 void veCVar::reset( const char *varName )
 {
-	veCVar::set2( varName, nullptr, true );
+	veCVar::set2( varName, nullptr, false );
 }
 
 void veCVar::forceReset( const char *varName )
@@ -616,13 +718,13 @@ void veCVar::writeVariables( veFileData& f )
 					dinfo( "WARNING: value of variable \"%s\" too long to write to file\n", var->m_name.c_str() );
 					continue;
 				}
-				sprintf_s( buffer.data(), buffer.size(), "seta %s \"%s\"\n", var->m_name.c_str(), var->m_latchedString.c_str() );
+				std::snprintf( buffer.data(), buffer.size(), "seta %s \"%s\"\n", var->m_name.c_str(), var->m_latchedString.c_str() );
 			} else {
 				if( var->m_name.length() + var->m_string.length() + 10 > buffer.size() ) {
 					dinfo( "WARNING: value of variable \"%s\" too long to write to file\n", var->m_name.c_str() );
 					continue;
 				}
-				sprintf_s( buffer.data(), buffer.size(), "seta %s \"%s\"\n", var->m_name.c_str(), var->m_string.c_str() );
+				std::snprintf( buffer.data(), buffer.size(), "seta %s \"%s\"\n", var->m_name.c_str(), var->m_string.c_str() );
 			}
 
 			auto slen = strlen( buffer.data() );
@@ -683,9 +785,23 @@ void veCVar::updateFromIntegerFloatValues()
 {
 	for( auto& cv : m_globalCVarTable ) {
 		auto var = cv.second.get();
-		if ( var->m_flags & VE_CVAR_ALLOW_SET_INTEGER && var->m_integer != atoi( var->m_string.c_str() ) ) {
-			veCVar::set( var->m_name.c_str(), veq3_va( "%d", var->m_integer ) );
+		if( !( var->m_flags & VE_CVAR_ALLOW_SET_INTEGER ) ) {
 			continue;
+		}
+
+		const float parsedValue = (float) atof( var->m_string.c_str() );
+		const int parsedInteger = atoi( var->m_string.c_str() );
+		if( var->m_value != parsedValue ) {
+			if( veIsIntegral( var->m_value ) ) {
+				veCVar::set( var->m_name.c_str(), veq3_va( "%d", ( int ) var->m_value ) );
+			} else {
+				veCVar::set( var->m_name.c_str(), veq3_va( "%f", var->m_value ) );
+			}
+			continue;
+		}
+
+		if( var->m_integer != parsedInteger ) {
+			veCVar::set( var->m_name.c_str(), veq3_va( "%d", var->m_integer ) );
 		}
 	}
 }
@@ -704,6 +820,7 @@ veCmd::veCmd()
 	m_cmd.reserve( 2048 );
 
 	m_functions.reserve( 512 );
+	m_aliases.reserve( 128 );
 }
 
 veCmd::~veCmd()
@@ -721,8 +838,12 @@ void veCmd::execute( veCmdExecWhen when, const char* text )
 			}
 			break;
 		case VE_CMD_EXEC_INSERT:
-			m_text += "\n";
-			m_text += text;
+			if( text && *text ) {
+				if( m_text.length() ) {
+					m_text.insert( 0, "\n" );
+				}
+				m_text.insert( 0, text );
+			}
 			break;
 		case VE_CMD_EXEC_APPEND:
 			m_text += text;
@@ -800,7 +921,10 @@ void veCmd::execute()
 			m_text.erase( m_text.begin(), m_text.begin() + i );
 		}
 
-		this->executeString( m_line.c_str() );
+		this->tokenizeString( m_line.c_str() );
+		if( this->argc() ) {
+			this->executeTokenized();
+		}
 	}
 }
 
@@ -991,35 +1115,18 @@ void veCmd::executeString( const char *text )
 		return;
 	}
 
-	// Handle semicolons - split and execute multiple commands
-	std::string cmdBuffer = text;
-	size_t pos = 0;
-	while ( ( pos = cmdBuffer.find( ';' ) ) != std::string::npos ) {
-		std::string cmd = cmdBuffer.substr( 0, pos );
-		cmdBuffer.erase( 0, pos + 1 );
-		
-		// Trim leading whitespace from remaining buffer
-		size_t start = cmdBuffer.find_first_not_of( " \t\r\n" );
-		if ( start != std::string::npos ) {
-			cmdBuffer = cmdBuffer.substr( start );
-		}
-
-		// Execute this command
-		this->tokenizeString( cmd.c_str() );
-		if ( this->argc() ) {
-			this->executeTokenized();
-		}
-	}
-
-	// Execute the last command (or single command if no semicolons)
-	this->tokenizeString( cmdBuffer.c_str() );
-	if ( this->argc() ) {
-		this->executeTokenized();
-	}
+	this->execute( VE_CMD_EXEC_INSERT, text );
+	this->execute();
 }
 
 void veCmd::executeTokenized()
 {
+	auto aliasIt = m_aliases.find( this->argv( 0 ) );
+	if( aliasIt != m_aliases.end() ) {
+		this->execute( VE_CMD_EXEC_INSERT, aliasIt->second.c_str() );
+		return;
+	}
+
 	// Check registered command functions
 	auto it = m_functions.find( this->argv( 0 ) );
 	if( it != m_functions.end() ) {
@@ -1069,6 +1176,10 @@ void veCmd::commandCompletion( std::function< void( const char *s, const char *e
 {
 	for( auto& it : m_functions ) {
 		callback( it.first.c_str(), it.second.complete.length() ? it.second.complete.c_str() : nullptr );
+	}
+
+	for( auto& alias : m_aliases ) {
+		callback( alias.first.c_str(), nullptr );
 	}
 }
 
@@ -1196,6 +1307,60 @@ void veCmd_WaitFunc( void )
 void veCmd_EchoFunc()
 {
 	dinfo( "%s\n", veGetCmd().args().c_str() );
+}
+
+void veCmd_AliasFunc()
+{
+	auto& c = veGetCmd();
+
+	if( c.argc() == 1 ) {
+		for( const auto& alias : c.getAliases() ) {
+			dinfo( "%s : %s\n", alias.first.c_str(), alias.second.c_str() );
+		}
+		dinfo( "%d aliases\n", c.getAliases().size() );
+		return;
+	}
+
+	auto name = c.argv( 1 );
+	if( !veIsValidConsoleToken( name ) || strcmp( name, "alias" ) == 0 ) {
+		dinfo( "alias: invalid alias name '%s'\n", name );
+		return;
+	}
+
+	if( c.argc() == 2 ) {
+		auto it = c.getAliases().find( name );
+		if( it == c.getAliases().end() ) {
+			dinfo( "alias %s does not exist.\n", name );
+			return;
+		}
+
+		dinfo( "%s : %s\n", it->first.c_str(), it->second.c_str() );
+		return;
+	}
+
+	c.getAliases()[name] = c.argsFrom( 2 );
+}
+
+void veCmd_ExecFunc()
+{
+	auto& c = veGetCmd();
+	if( c.argc() != 2 ) {
+		dinfo( "usage: exec <filename>\n" );
+		return;
+	}
+
+	std::ifstream file( c.argv( 1 ), std::ios::binary );
+	if( !file ) {
+		dinfo( "couldn't exec %s\n", c.argv( 1 ) );
+		return;
+	}
+
+	std::string contents( ( std::istreambuf_iterator< char >( file ) ), std::istreambuf_iterator< char >() );
+	if( contents.empty() ) {
+		return;
+	}
+
+	c.execute( VE_CMD_EXEC_INSERT, contents.c_str() );
 }
 
 void veCmd_ListFunc()
@@ -1355,6 +1520,7 @@ void veCVar_InitCmd()
 {
 	auto& c = veGetCmd();
 	
+	c.addCommand( "alias", veCmd_AliasFunc );
 	c.addCommand( "print", veCVarCmd_PrintFunc );
 	c.setCommandCompletion( "print", "C_V_" );
 	c.addCommand( "toggle", veCVarCmd_ToggleFunc );
@@ -1387,6 +1553,7 @@ void veCmd_InitDefaultFunctions()
 	auto& c = veGetCmd();
 	c.addCommand( "cmdlist", veCmd_ListFunc );
 	c.addCommand( "echo", veCmd_EchoFunc );
+	c.addCommand( "exec", veCmd_ExecFunc );
 	c.addCommand( "wait", veCmd_WaitFunc );
 
 	veCVar_InitCmd();
@@ -1401,15 +1568,15 @@ void veCmd_InitDefaultFunctions()
 char* veq3_va( const char *format, ... )
 {
 	va_list		argptr;
-	static char string[2][8192]; // in case va is called by nested functions
-	static int	index = 0;
+	static thread_local std::array< std::array< char, 8192 >, 4 > string;
+	static thread_local size_t index = 0;
 	char		*buf;
 
-	buf = string[index & 1];
+	buf = string[index % string.size()].data();
 	index++;
 
 	va_start( argptr, format );
-	vsnprintf( buf, sizeof( *string ), format, argptr );
+	vsnprintf( buf, string.front().size(), format, argptr );
 	va_end( argptr );
 
 	return buf;
