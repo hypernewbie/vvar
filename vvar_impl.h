@@ -700,7 +700,6 @@ void veCVar::writeVariables( veFileData& f )
 	std::vector< char > buffer;
 	std::vector< uint8_t >& bufferData = f;
 
-	int ptr = 0;
 	buffer.resize( 8192 );
 	bufferData.reserve( 65535 );
 
@@ -999,7 +998,6 @@ void veCmd::tokenizeString2( const char *text, bool ignoreQuotes )
 	}
 
 	m_cmd = text;
-	auto t = text;
 	m_tokens.clear();
 
 	while ( 1 ) {
@@ -1557,6 +1555,37 @@ void veCmd_InitDefaultFunctions()
 	c.addCommand( "wait", veCmd_WaitFunc );
 
 	veCVar_InitCmd();
+}
+
+// ------------------------------------------------- Startup Command Extraction -------------------------------------------------
+
+void veExtractStartupCommands( int argc, const char* const argv[],
+                                std::vector< std::string >& outRemainingArgv,
+                                std::vector< std::string >& outCommands )
+{
+	outRemainingArgv.clear();
+	outCommands.clear();
+
+	for( int i = 0; i < argc; i++ ) {
+		if( argv[i][0] == '+' && argv[i][1] != '\0' ) {
+			// Start a new command from the token after the '+'
+			std::string cmd = &argv[i][1];
+			while( i + 1 < argc && argv[i + 1][0] != '+' ) {
+				i++;
+				cmd += ' ';
+				cmd += argv[i];
+			}
+			outCommands.push_back( std::move( cmd ) );
+		} else {
+			outRemainingArgv.push_back( argv[i] );
+		}
+	}
+}
+
+void veExecuteStartupCommands( const std::vector< std::string >& commands )
+{
+	for( const auto& cmd : commands )
+		veGetCmd().execute( VE_CMD_EXEC_NOW, cmd.c_str() );
 }
 
 // ------------------------------------------------- Misc. Other Utils -------------------------------------------------

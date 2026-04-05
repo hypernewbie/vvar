@@ -753,7 +753,6 @@ UTEST(veCVar, latched_value_after_restart) {
 
 UTEST(veCVar, getModifiedFlags) {
     resetVvarForTest();
-    int initialFlags = veCVar::getModifiedFlags();
     veCVar::get("modified_flags_test", "value", VE_CVAR_ARCHIVE);
     int newFlags = veCVar::getModifiedFlags();
     EXPECT_TRUE(newFlags & VE_CVAR_ARCHIVE);
@@ -786,7 +785,7 @@ UTEST(veCmd, commandCompletion) {
     resetVvarForTest();
     int callbackCount = 0;
     veGetCmd().addCommand("completion_test", [](){});
-    veGetCmd().commandCompletion([&callbackCount](const char* s, const char* expr) {
+    veGetCmd().commandCompletion([&callbackCount](const char*, const char*) {
         callbackCount++;
     });
     EXPECT_TRUE(callbackCount > 0);
@@ -1005,6 +1004,63 @@ UTEST(sv_cheats, is_initialized) {
 UTEST(g_cmd, is_initialized) {
     resetVvarForTest();
     ASSERT_NE(g_cmd.get(), nullptr);
+}
+
+// ======================= veExtractStartupCommands =======================
+
+UTEST(veExtractStartupCommands, basic_extraction) {
+    const char* argv[] = { "exe", "--null", "+set", "r_debug", "1", "+exec", "my.cfg" };
+    std::vector< std::string > remaining, commands;
+    veExtractStartupCommands( 7, argv, remaining, commands );
+
+    ASSERT_EQ( 2u, commands.size() );
+    EXPECT_STREQ( "set r_debug 1", commands[0].c_str() );
+    EXPECT_STREQ( "exec my.cfg",   commands[1].c_str() );
+
+    ASSERT_EQ( 2u, remaining.size() );
+    EXPECT_STREQ( "exe",    remaining[0].c_str() );
+    EXPECT_STREQ( "--null", remaining[1].c_str() );
+}
+
+UTEST(veExtractStartupCommands, no_commands) {
+    const char* argv[] = { "exe", "--foo", "bar" };
+    std::vector< std::string > remaining, commands;
+    veExtractStartupCommands( 3, argv, remaining, commands );
+
+    EXPECT_TRUE( commands.empty() );
+    ASSERT_EQ( 3u, remaining.size() );
+    EXPECT_STREQ( "exe",   remaining[0].c_str() );
+    EXPECT_STREQ( "--foo", remaining[1].c_str() );
+    EXPECT_STREQ( "bar",   remaining[2].c_str() );
+}
+
+UTEST(veExtractStartupCommands, adjacent_commands) {
+    const char* argv[] = { "exe", "+foo", "+bar" };
+    std::vector< std::string > remaining, commands;
+    veExtractStartupCommands( 3, argv, remaining, commands );
+
+    ASSERT_EQ( 2u, commands.size() );
+    EXPECT_STREQ( "foo", commands[0].c_str() );
+    EXPECT_STREQ( "bar", commands[1].c_str() );
+    ASSERT_EQ( 1u, remaining.size() );
+}
+
+UTEST(veExtractStartupCommands, empty_argv) {
+    std::vector< std::string > remaining, commands;
+    veExtractStartupCommands( 0, nullptr, remaining, commands );
+
+    EXPECT_TRUE( commands.empty() );
+    EXPECT_TRUE( remaining.empty() );
+}
+
+UTEST(veExecuteStartupCommands, sets_cvar) {
+    resetVvarForTest();
+    const char* argv[] = { "exe", "+set", "startup_var", "42" };
+    std::vector< std::string > remaining, commands;
+    veExtractStartupCommands( 4, argv, remaining, commands );
+    veExecuteStartupCommands( commands );
+
+    EXPECT_EQ( 42, veCVar::variableIntegerValue( "startup_var" ) );
 }
 
 UTEST_MAIN()

@@ -543,6 +543,20 @@ inline veCmd& veGetCmd()
 
 void veCmd_InitDefaultFunctions();
 
+// Scans argv for +command tokens. Each '+' starts a new command that runs
+// until the next '+' or end of argv. Non-command args are collected separately.
+//
+// e.g. argv: {"exe", "--null", "+set", "r_debug", "1", "+exec", "my.cfg"}
+// -> outCommands:      {"set r_debug 1", "exec my.cfg"}
+// -> outRemainingArgv: {"exe", "--null"}
+//
+void veExtractStartupCommands( int argc, const char* const argv[],
+                                std::vector< std::string >& outRemainingArgv,
+                                std::vector< std::string >& outCommands );
+
+// Executes startup commands through the command buffer immediately.
+void veExecuteStartupCommands( const std::vector< std::string >& commands );
+
 
 // ------------------------------------------------- Misc. Other Utils -------------------------------------------------
 
