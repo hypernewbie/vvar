@@ -1,4 +1,4 @@
-// vvar Tests - Comprehensive test suite for vvar (renamed from q3_util)
+// vvar Tests - Comprehensive test suite for vvar.
 #define UTEST_USE_COLORS 1
 #include "utest.h"
 
@@ -17,7 +17,23 @@ static void resetVvarForTest() {
     veCVar::init();
     veCmd_InitDefaultFunctions();
     veGetCmd().getAliases().clear();
+    // Commands are not cleared by init(); addCommand ignores duplicates, so stale
+    // lambdas (capturing dead stack state) would survive across tests. Clear them and
+    // re-register the defaults to keep each test hermetic.
+    veGetCmd().getFunctionsList().clear();
+    // Drain any command text left buffered by a previous test. wait state can re-block
+    // each frame, so clear it every iteration.
+    for (int i = 0; i < 64; i++) {
+        veGetCmd().setWait(0);
+        veGetCmd().execute(VE_CMD_EXEC_NOW);
+    }
     veGetCmd().setWait(0);
+    veCVar_InitCmd();
+    veGetCmd().addCommand("cmdlist", veCmd_ListFunc);
+    veGetCmd().addCommand("echo", veCmd_EchoFunc);
+    veGetCmd().addCommand("exec", veCmd_ExecFunc);
+    veGetCmd().addCommand("wait", veCmd_WaitFunc);
+    vvarTestClearLog();
 }
 
 static bool logContains(const char* text) {
@@ -1061,6 +1077,860 @@ UTEST(veExecuteStartupCommands, sets_cvar) {
     veExecuteStartupCommands( commands );
 
     EXPECT_EQ( 42, veCVar::variableIntegerValue( "startup_var" ) );
+}
+
+// =====================================================================================
+// ============================ EXPANDED COVERAGE (Phase 1) =============================
+// =====================================================================================
+// These tests characterize the current observable behavior of the library so that the
+// public API is locked down against regressions. They exercise only the public API
+// and assert on observed results.
+
+// ------------------------------- veIsANumber deep --------------------------------
+UTEST(veIsANumber_x, leading_trailing_space) {
+    resetVvarForTest();
+    // strtod skips leading whitespace, so leading space parses; trailing junk fails
+    EXPECT_TRUE(veIsANumber("  12"));
+    EXPECT_FALSE(veIsANumber("12 "));
+    EXPECT_FALSE(veIsANumber(" "));
+}
+
+UTEST(veIsANumber_x, scientific_and_signs) {
+    resetVvarForTest();
+    EXPECT_TRUE(veIsANumber("1e5"));
+    EXPECT_TRUE(veIsANumber("-1.5e-3"));
+    EXPECT_TRUE(veIsANumber("+3"));
+    EXPECT_TRUE(veIsANumber(".5"));
+    EXPECT_TRUE(veIsANumber("5."));
+}
+
+UTEST(veIsANumber_x, hex_and_inf_nan) {
+    resetVvarForTest();
+    // strtod parses these fully on typical libc
+    EXPECT_TRUE(veIsANumber("0x1p4"));
+    EXPECT_TRUE(veIsANumber("inf"));
+    EXPECT_TRUE(veIsANumber("nan"));
+    EXPECT_FALSE(veIsANumber("infinityx"));
+}
+
+UTEST(veIsIntegral_x, boundaries) {
+    resetVvarForTest();
+    EXPECT_TRUE(veIsIntegral(1000000.0f));
+    EXPECT_TRUE(veIsIntegral(-42.0f));
+    EXPECT_FALSE(veIsIntegral(0.0001f));
+}
+
+// ------------------------------- veIVar edge cases --------------------------------
+UTEST(veIVar_x, tostring_empty_section_returns_empty) {
+    resetVvarForTest();
+    EXPECT_STREQ("", veIVar::toString("nope"));
+}
+
+UTEST(veIVar_x, tostring_null_section) {
+    resetVvarForTest();
+    // null section maps to the "" section; clear it first (veIVar table is global
+    // and not reset by resetVvarForTest).
+    veIVar::fromString(nullptr, "");
+    EXPECT_STREQ("", veIVar::toString(nullptr));
+}
+
+UTEST(veIVar_x, remove_last_key_erases_section) {
+    resetVvarForTest();
+    veIVar::set("s", "k", "v");
+    veIVar::remove("s", "k");
+    EXPECT_STREQ("", veIVar::toString("s"));
+    EXPECT_EQ(nullptr, veIVar::get("s", "k"));
+}
+
+UTEST(veIVar_x, fromstring_empty_string_clears) {
+    resetVvarForTest();
+    veIVar::set("s", "k", "v");
+    veIVar::fromString("s", "");
+    EXPECT_EQ(nullptr, veIVar::get("s", "k"));
+}
+
+UTEST(veIVar_x, fromstring_null_infostring_clears) {
+    resetVvarForTest();
+    veIVar::set("s", "k", "v");
+    veIVar::fromString("s", nullptr);
+    EXPECT_EQ(nullptr, veIVar::get("s", "k"));
+}
+
+UTEST(veIVar_x, fromstring_no_leading_backslash) {
+    resetVvarForTest();
+    veIVar::fromString("s", "name\\hero");
+    EXPECT_STREQ("hero", veIVar::get("s", "name"));
+}
+
+UTEST(veIVar_x, fromstring_trailing_key_no_value) {
+    resetVvarForTest();
+    // "\a\1\b" -> b has no value, dropped; a=1 kept
+    veIVar::fromString("s", "\\a\\1\\b");
+    EXPECT_STREQ("1", veIVar::get("s", "a"));
+    EXPECT_EQ(nullptr, veIVar::get("s", "b"));
+}
+
+UTEST(veIVar_x, fromstring_duplicate_keys_last_wins) {
+    resetVvarForTest();
+    veIVar::fromString("s", "\\k\\first\\k\\second");
+    EXPECT_STREQ("second", veIVar::get("s", "k"));
+}
+
+UTEST(veIVar_x, tostring_skips_invalid_chars) {
+    resetVvarForTest();
+    // Set a value directly containing a quote/backslash/semicolon via map set
+    veIVar::set("s", "good", "ok");
+    veIVar::set("s", "bad", "a\"b");
+    std::string out = veIVar::toString("s");
+    EXPECT_TRUE(out.find("\\good\\ok") != std::string::npos);
+    EXPECT_TRUE(out.find("bad") == std::string::npos);
+}
+
+// ------------------------------- veCVar get semantics --------------------------------
+UTEST(veCVar_x, get_empty_value_does_not_override_existing) {
+    resetVvarForTest();
+    veCVar::get("v", "orig", 0);
+    veCVar::get("v", "", 0);
+    EXPECT_STREQ("orig", veCVar::variableString("v"));
+}
+
+UTEST(veCVar_x, get_ors_in_flags_on_reregister) {
+    resetVvarForTest();
+    veCVar::get("v", "1", VE_CVAR_ARCHIVE);
+    veCVar* cv = veCVar::get("v", "1", VE_CVAR_USERINFO);
+    EXPECT_TRUE(cv->getFlags() & VE_CVAR_ARCHIVE);
+    EXPECT_TRUE(cv->getFlags() & VE_CVAR_USERINFO);
+}
+
+UTEST(veCVar_x, get_null_value_returns_null) {
+    resetVvarForTest();
+    EXPECT_EQ(nullptr, veCVar::get("v", nullptr, 0));
+}
+
+UTEST(veCVar_x, get_reports_conflicting_reset_value) {
+    resetVvarForTest();
+    veCVar::get("v", "a", 0);
+    vvarTestClearLog();
+    veCVar::get("v", "b", 0);
+    EXPECT_TRUE(logContains("different") || logContains("initial values"));
+}
+
+UTEST(veCVar_x, get_applies_latched_string_on_reregister) {
+    resetVvarForTest();
+    veCVar::get("v", "def", VE_CVAR_LATCH);
+    veCVar::setLatched("v", "new");
+    EXPECT_STREQ("def", veCVar::variableString("v"));
+    // Re-registering pulls in the latched value
+    veCVar::get("v", "def", VE_CVAR_LATCH);
+    EXPECT_STREQ("new", veCVar::variableString("v"));
+}
+
+// ------------------------------- set2 / latch / rom / init --------------------------------
+UTEST(veCVar_x, set_same_value_no_modification) {
+    resetVvarForTest();
+    veCVar* cv = veCVar::get("v", "x", 0);
+    int mc = cv->getModificationCount();
+    veCVar::set("v", "x");
+    EXPECT_EQ(mc, cv->getModificationCount());
+}
+
+UTEST(veCVar_x, init_flag_blocks_console_set) {
+    resetVvarForTest();
+    veCVar::get("v", "init", VE_CVAR_INIT);
+    veCVar::set2("v", "changed", false);
+    EXPECT_STREQ("init", veCVar::variableString("v"));
+}
+
+UTEST(veCVar_x, latch_double_set_updates_pending) {
+    resetVvarForTest();
+    veCVar::get("v", "def", VE_CVAR_LATCH);
+    veCVar::setLatched("v", "one");
+    veCVar::setLatched("v", "two");
+    EXPECT_STREQ("def", veCVar::variableString("v"));
+    veCVar::restart();
+    EXPECT_STREQ("two", veCVar::variableString("v"));
+}
+
+UTEST(veCVar_x, latch_set_back_to_current_is_noop_quirk) {
+    resetVvarForTest();
+    veCVar::get("v", "def", VE_CVAR_LATCH);
+    veCVar::setLatched("v", "one");
+    // Setting latch back to the current string value short-circuits at the top-of-set2
+    // equality check BEFORE the latch handling, so the pending "one" is NOT cleared.
+    veCVar::setLatched("v", "def");
+    veCVar::restart();
+    EXPECT_STREQ("one", veCVar::variableString("v"));
+}
+
+UTEST(veCVar_x, force_set_clears_latch) {
+    resetVvarForTest();
+    veCVar::get("v", "def", VE_CVAR_LATCH);
+    veCVar::setLatched("v", "pending");
+    veCVar::set2("v", "forced", true);
+    EXPECT_STREQ("forced", veCVar::variableString("v"));
+    // restart() resets non-ROM/INIT/NORESTART vars: latch is cleared, so it falls back
+    // to the reset string "def".
+    veCVar::restart();
+    EXPECT_STREQ("def", veCVar::variableString("v"));
+}
+
+UTEST(veCVar_x, rom_set_emits_message) {
+    resetVvarForTest();
+    veCVar::get("v", "ro", VE_CVAR_ROM);
+    vvarTestClearLog();
+    veCVar::set2("v", "x", false);
+    EXPECT_TRUE(logContains("read only"));
+}
+
+// ------------------------------- cheats --------------------------------
+UTEST(veCVar_x, cheat_set_allowed_when_cheats_on) {
+    resetVvarForTest();
+    veCVar::get("v", "safe", VE_CVAR_CHEAT);
+    veCVar::set2("sv_cheats", "1", true);
+    veCVar::set2("v", "hacked", false);
+    EXPECT_STREQ("hacked", veCVar::variableString("v"));
+}
+
+UTEST(veCVar_x, setCheatState_resets_cheat_vars) {
+    resetVvarForTest();
+    veCVar::set2("sv_cheats", "1", true);
+    veCVar::get("v", "safe", VE_CVAR_CHEAT);
+    veCVar::set2("v", "hacked", false);
+    EXPECT_STREQ("hacked", veCVar::variableString("v"));
+    veCVar::setCheatState();
+    EXPECT_STREQ("safe", veCVar::variableString("v"));
+}
+
+// ------------------------------- setSafe / protected --------------------------------
+UTEST(veCVar_x, setSafe_blocks_protected) {
+    resetVvarForTest();
+    veCVar::get("v", "orig", VE_CVAR_PROTECTED);
+    vvarTestClearLog();
+    veCVar::setSafe("v", "evil");
+    EXPECT_STREQ("orig", veCVar::variableString("v"));
+    EXPECT_TRUE(logContains("Restricted source"));
+}
+
+UTEST(veCVar_x, setSafe_allows_normal) {
+    resetVvarForTest();
+    veCVar::get("v", "orig", 0);
+    veCVar::setSafe("v", "ok");
+    EXPECT_STREQ("ok", veCVar::variableString("v"));
+}
+
+// ------------------------------- validate / range --------------------------------
+UTEST(veCVar_x, checkRange_min_boundary_inclusive) {
+    resetVvarForTest();
+    veCVar* cv = veCVar::get("v", "5", 0);
+    veCVar::checkRange(cv, 0.0f, 10.0f, false);
+    veCVar::set("v", "0");
+    EXPECT_NEAR(0.0f, veCVar::variableValue("v"), 0.001f);
+}
+
+UTEST(veCVar_x, checkRange_non_numeric_falls_back_to_reset) {
+    resetVvarForTest();
+    veCVar* cv = veCVar::get("v", "5", 0);
+    veCVar::checkRange(cv, 0.0f, 10.0f, false);
+    veCVar::set("v", "abc");
+    EXPECT_NEAR(5.0f, veCVar::variableValue("v"), 0.001f);
+}
+
+UTEST(veCVar_x, checkRange_integral_rounds_down) {
+    resetVvarForTest();
+    veCVar* cv = veCVar::get("v", "5", 0);
+    veCVar::checkRange(cv, 0.0f, 100.0f, true);
+    veCVar::set("v", "7.9");
+    EXPECT_EQ(7, veCVar::variableIntegerValue("v"));
+}
+
+// ------------------------------- flags() modified bit --------------------------------
+UTEST(veCVar_x, flags_modified_bit_set_after_change) {
+    resetVvarForTest();
+    veCVar::get("v", "a", 0);
+    veCVar::set("v", "b");
+    EXPECT_TRUE(veCVar::flags("v") & VE_CVAR_MODIFIED);
+}
+
+// ------------------------------- writeVariables --------------------------------
+UTEST(veCVar_x, writeVariables_only_archive) {
+    resetVvarForTest();
+    veCVar::get("arch", "1", VE_CVAR_ARCHIVE);
+    veCVar::get("noarch", "2", 0);
+    veFileData data;
+    veCVar::writeVariables(data);
+    std::string s(data.begin(), data.end());
+    EXPECT_TRUE(s.find("seta arch") != std::string::npos);
+    EXPECT_TRUE(s.find("noarch") == std::string::npos);
+}
+
+UTEST(veCVar_x, writeVariables_uses_latched_value) {
+    resetVvarForTest();
+    veCVar::get("v", "def", VE_CVAR_ARCHIVE | VE_CVAR_LATCH);
+    veCVar::setLatched("v", "pending");
+    veFileData data;
+    veCVar::writeVariables(data);
+    std::string s(data.begin(), data.end());
+    EXPECT_TRUE(s.find("pending") != std::string::npos);
+}
+
+// ------------------------------- command dispatch --------------------------------
+UTEST(veCmd_x, unknown_command_reports) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("no_such_command_xyz");
+    EXPECT_TRUE(logContains("unknown command"));
+}
+
+UTEST(veCmd_x, cmd_returns_raw_input) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("foo bar baz");
+    EXPECT_STREQ("foo bar baz", veGetCmd().cmd());
+}
+
+UTEST(veCmd_x, argv_out_of_range_returns_empty) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("one two");
+    EXPECT_STREQ("", veGetCmd().argv(5));
+    EXPECT_STREQ("", veGetCmd().argv(2));
+}
+
+UTEST(veCmd_x, argsFrom_negative_clamped_to_zero) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("a b c");
+    std::string s = veGetCmd().argsFrom(-3);
+    EXPECT_STREQ("a b c", s.c_str());
+}
+
+UTEST(veCmd_x, args_empty_when_single_token) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("solo");
+    std::string s = veGetCmd().args();
+    EXPECT_STREQ("", s.c_str());
+}
+
+// ------------------------------- tokenizer edge cases --------------------------------
+UTEST(veCmd_x, tokenize_star_comment_block) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("a /* comment */ b");
+    EXPECT_EQ(2, veGetCmd().argc());
+    EXPECT_STREQ("a", veGetCmd().argv(0));
+    EXPECT_STREQ("b", veGetCmd().argv(1));
+}
+
+UTEST(veCmd_x, tokenize_unterminated_quote) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("a \"unterminated");
+    EXPECT_EQ(2, veGetCmd().argc());
+    EXPECT_STREQ("unterminated", veGetCmd().argv(1));
+}
+
+UTEST(veCmd_x, tokenize_tabs_as_whitespace) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("a\tb\tc");
+    EXPECT_EQ(3, veGetCmd().argc());
+}
+
+UTEST(veCmd_x, tokenize_null_text_no_args) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString(nullptr);
+    EXPECT_EQ(0, veGetCmd().argc());
+}
+
+UTEST(veCmd_x, tokenize_quote_breaks_regular_token) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("ab\"cd\"");
+    // ab then quoted cd
+    EXPECT_EQ(2, veGetCmd().argc());
+    EXPECT_STREQ("ab", veGetCmd().argv(0));
+    EXPECT_STREQ("cd", veGetCmd().argv(1));
+}
+
+// ------------------------------- command buffer semantics --------------------------------
+UTEST(veCmd_x, semicolon_inside_quotes_not_split) {
+    resetVvarForTest();
+    veCVar::get("v", "x", 0);
+    veGetCmd().executeString("set v \"a;b\"");
+    EXPECT_STREQ("a;b", veCVar::variableString("v"));
+}
+
+UTEST(veCmd_x, wait_defers_remaining_buffer) {
+    resetVvarForTest();
+    int count = 0;
+    veGetCmd().addCommand("inc", [&count]() { count++; });
+    // append then execute frames
+    veGetCmd().execute(VE_CMD_EXEC_APPEND, "inc\nwait\ninc\n");
+    veGetCmd().execute(VE_CMD_EXEC_NOW);
+    EXPECT_EQ(1, count); // stopped at wait
+    veGetCmd().execute(VE_CMD_EXEC_NOW);
+    EXPECT_EQ(2, count); // second frame runs remainder
+}
+
+UTEST(veCmd_x, insert_prepends_to_buffer) {
+    resetVvarForTest();
+    std::string order;
+    veGetCmd().addCommand("a", [&order]() { order += "a"; });
+    veGetCmd().addCommand("b", [&order]() { order += "b"; });
+    veGetCmd().execute(VE_CMD_EXEC_APPEND, "a\n");
+    veGetCmd().execute(VE_CMD_EXEC_INSERT, "b");
+    veGetCmd().execute(VE_CMD_EXEC_NOW);
+    EXPECT_STREQ("ba", order.c_str());
+}
+
+// ------------------------------- aliases --------------------------------
+UTEST(veCmd_x, alias_list_when_no_args) {
+    resetVvarForTest();
+    veGetCmd().executeString("alias myalias echo hi");
+    vvarTestClearLog();
+    veGetCmd().executeString("alias");
+    EXPECT_TRUE(logContains("myalias"));
+}
+
+UTEST(veCmd_x, alias_redefine) {
+    resetVvarForTest();
+    veGetCmd().executeString("alias a echo first");
+    veGetCmd().executeString("alias a echo second");
+    vvarTestClearLog();
+    veGetCmd().executeString("a");
+    EXPECT_TRUE(logContains("second"));
+    EXPECT_FALSE(logContains("first"));
+}
+
+UTEST(veCmd_x, alias_rejects_reserved_name) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("alias alias foo");
+    EXPECT_TRUE(logContains("invalid alias name"));
+}
+
+UTEST(veCmd_x, alias_query_nonexistent) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("alias ghost");
+    EXPECT_TRUE(logContains("does not exist"));
+}
+
+// ------------------------------- exec edge cases --------------------------------
+UTEST(veCmd_x, exec_missing_file_reports) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("exec definitely_missing_file_123.cfg");
+    EXPECT_TRUE(logContains("couldn't exec"));
+}
+
+UTEST(veCmd_x, exec_wrong_args_usage) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("exec");
+    EXPECT_TRUE(logContains("usage: exec"));
+}
+
+// ------------------------------- toggle --------------------------------
+UTEST(veCVarCmd_x, toggle_from_one_to_zero) {
+    resetVvarForTest();
+    veCVar::get("v", "1", 0);
+    veGetCmd().executeString("toggle v");
+    EXPECT_STREQ("0", veCVar::variableString("v"));
+}
+
+UTEST(veCVarCmd_x, toggle_cycles_value_list) {
+    resetVvarForTest();
+    veCVar::get("v", "a", 0);
+    veGetCmd().executeString("toggle v a b c");
+    EXPECT_STREQ("b", veCVar::variableString("v"));
+    veGetCmd().executeString("toggle v a b c");
+    EXPECT_STREQ("c", veCVar::variableString("v"));
+    veGetCmd().executeString("toggle v a b c");
+    EXPECT_STREQ("a", veCVar::variableString("v")); // wraps
+}
+
+UTEST(veCVarCmd_x, toggle_no_args_usage) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("toggle");
+    EXPECT_TRUE(logContains("usage: toggle"));
+}
+
+// ------------------------------- set variants no-arg printing --------------------------------
+UTEST(veCVarCmd_x, set_one_arg_prints) {
+    resetVvarForTest();
+    veCVar::get("v", "val", 0);
+    vvarTestClearLog();
+    veGetCmd().executeString("set v");
+    EXPECT_TRUE(logContains("v"));
+    EXPECT_STREQ("val", veCVar::variableString("v"));
+}
+
+UTEST(veCVarCmd_x, set_no_args_usage) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("set");
+    EXPECT_TRUE(logContains("usage"));
+}
+
+UTEST(veCVarCmd_x, set_multi_token_value_joined) {
+    resetVvarForTest();
+    veGetCmd().executeString("set v hello world foo");
+    EXPECT_STREQ("hello world foo", veCVar::variableString("v"));
+}
+
+UTEST(veCVarCmd_x, set_creates_cvar) {
+    resetVvarForTest();
+    veGetCmd().executeString("set newvar 99");
+    EXPECT_EQ(99, veCVar::variableIntegerValue("newvar"));
+}
+
+// ------------------------------- print command --------------------------------
+UTEST(veCVarCmd_x, print_nonexistent) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("print ghostvar");
+    EXPECT_TRUE(logContains("does not exist"));
+}
+
+// ------------------------------- cvar_modified --------------------------------
+UTEST(veCVarCmd_x, cvar_modified_lists_changed) {
+    resetVvarForTest();
+    veCVar::get("changed", "d", 0);
+    veCVar::set("changed", "m");
+    vvarTestClearLog();
+    veGetCmd().executeString("cvar_modified");
+    EXPECT_TRUE(logContains("changed"));
+}
+
+// ------------------------------- filter deep --------------------------------
+UTEST(veCmd_x, filter_char_range) {
+    resetVvarForTest();
+    EXPECT_TRUE(veCmd::filter("[a-c]at", "bat"));
+    EXPECT_FALSE(veCmd::filter("[a-c]at", "zat"));
+}
+
+UTEST(veCmd_x, filter_leading_and_trailing_star) {
+    resetVvarForTest();
+    EXPECT_TRUE(veCmd::filter("*mid*", "xxmidyy"));
+    EXPECT_FALSE(veCmd::filter("*mid*", "xxxyy"));
+}
+
+UTEST(veCmd_x, filter_exact_no_wildcard) {
+    resetVvarForTest();
+    EXPECT_TRUE(veCmd::filter("exact", "exact"));
+    EXPECT_FALSE(veCmd::filter("exact", "exactly"));
+}
+
+UTEST(veCmd_x, stringContains_not_found) {
+    resetVvarForTest();
+    EXPECT_EQ(nullptr, veCmd::stringContains("hello", "xyz"));
+}
+
+// ------------------------------- veq3_va rotating buffers --------------------------------
+UTEST(veq3_va_x, four_distinct_buffers) {
+    resetVvarForTest();
+    char* a = veq3_va("%d", 1);
+    char* b = veq3_va("%d", 2);
+    char* c = veq3_va("%d", 3);
+    char* d = veq3_va("%d", 4);
+    EXPECT_STREQ("1", a);
+    EXPECT_STREQ("2", b);
+    EXPECT_STREQ("3", c);
+    EXPECT_STREQ("4", d);
+    EXPECT_NE(a, b);
+    EXPECT_NE(b, c);
+}
+
+UTEST(veq3_va_x, fifth_call_reuses_first_buffer) {
+    resetVvarForTest();
+    char* a = veq3_va("%d", 1);
+    veq3_va("%d", 2);
+    veq3_va("%d", 3);
+    veq3_va("%d", 4);
+    char* e = veq3_va("%d", 5);
+    EXPECT_EQ(a, e);
+}
+
+// ------------------------------- misc integration --------------------------------
+UTEST(veCmd_x, cvar_command_change_via_bareword) {
+    resetVvarForTest();
+    veCVar::get("v", "old", 0);
+    veGetCmd().executeString("v newval");
+    EXPECT_STREQ("newval", veCVar::variableString("v"));
+}
+
+UTEST(veCmd_x, alias_takes_priority_over_command) {
+    resetVvarForTest();
+    bool cmdCalled = false;
+    veGetCmd().addCommand("shadow", [&cmdCalled]() { cmdCalled = true; });
+    veGetCmd().executeString("alias shadow echo aliased");
+    vvarTestClearLog();
+    veGetCmd().executeString("shadow");
+    EXPECT_TRUE(logContains("aliased"));
+    EXPECT_FALSE(cmdCalled);
+}
+
+// =====================================================================================
+// ============================ EXPANDED COVERAGE (batch 2) =============================
+// =====================================================================================
+
+// ------------------------------- numeric conversions --------------------------------
+UTEST(veCVar_y, variableValue_nonnumeric_is_zero) {
+    resetVvarForTest();
+    veCVar::get("v", "hello", 0);
+    EXPECT_NEAR(0.0f, veCVar::variableValue("v"), 0.001f);
+    EXPECT_EQ(0, veCVar::variableIntegerValue("v"));
+}
+
+UTEST(veCVar_y, variableInteger_truncates_float_string) {
+    resetVvarForTest();
+    veCVar::get("v", "42.9", 0);
+    EXPECT_EQ(42, veCVar::variableIntegerValue("v"));
+    EXPECT_NEAR(42.9f, veCVar::variableValue("v"), 0.001f);
+}
+
+UTEST(veCVar_y, variableValue_nonexistent_zero) {
+    resetVvarForTest();
+    EXPECT_NEAR(0.0f, veCVar::variableValue("ghost"), 0.001f);
+    EXPECT_EQ(0, veCVar::variableIntegerValue("ghost"));
+}
+
+UTEST(veCVar_y, setValue_integer_formatting) {
+    resetVvarForTest();
+    veCVar::get("v", "0", 0);
+    veCVar::setValue("v", 7.0f);
+    EXPECT_STREQ("7", veCVar::variableString("v"));
+}
+
+UTEST(veCVar_y, setValue_float_formatting) {
+    resetVvarForTest();
+    veCVar::get("v", "0", 0);
+    veCVar::setValue("v", 1.5f);
+    EXPECT_STREQ("1.500000", veCVar::variableString("v"));
+}
+
+UTEST(veCVar_y, setValueSafe_blocked_on_protected) {
+    resetVvarForTest();
+    veCVar::get("v", "0", VE_CVAR_PROTECTED);
+    veCVar::setValueSafe("v", 5.0f);
+    EXPECT_STREQ("0", veCVar::variableString("v"));
+}
+
+// ------------------------------- variableStringBuffer --------------------------------
+UTEST(veCVar_y, variableStringBuffer_copies) {
+    resetVvarForTest();
+    veCVar::get("v", "buffered", 0);
+    char buf[64];
+    veCVar::variableStringBuffer("v", buf, sizeof(buf));
+    EXPECT_STREQ("buffered", buf);
+}
+
+UTEST(veCVar_y, variableStringBuffer_nonexistent_empty) {
+    resetVvarForTest();
+    char buf[64];
+    buf[0] = 'X';
+    veCVar::variableStringBuffer("ghost", buf, sizeof(buf));
+    EXPECT_STREQ("", buf);
+}
+
+// ------------------------------- name validation --------------------------------
+UTEST(veCVar_y, name_with_semicolon_is_badname) {
+    resetVvarForTest();
+    veCVar* cv = veCVar::get("a;b", "v", 0);
+    ASSERT_NE(cv, nullptr);
+    EXPECT_STREQ("BADNAME", cv->getString().c_str());
+}
+
+UTEST(veCVar_y, name_with_quote_is_badname) {
+    resetVvarForTest();
+    veCVar* cv = veCVar::get("a\"b", "v", 0);
+    ASSERT_NE(cv, nullptr);
+    EXPECT_STREQ("BADNAME", cv->getString().c_str());
+}
+
+// ------------------------------- forceReset via reset semantics --------------------------------
+UTEST(veCVar_y, reset_nonexistent_no_crash) {
+    resetVvarForTest();
+    veCVar::reset("ghost");
+    SUCCEED();
+}
+
+// ------------------------------- list output flag letters --------------------------------
+UTEST(veCVar_y, list_shows_archive_letter) {
+    resetVvarForTest();
+    veCVar::get("av", "1", VE_CVAR_ARCHIVE);
+    vvarTestClearLog();
+    veCVar::list();
+    EXPECT_TRUE(logContains("av"));
+    EXPECT_TRUE(logContains("total cvars"));
+}
+
+UTEST(veCVar_y, list_with_match_filter) {
+    resetVvarForTest();
+    veCVar::get("keepme", "1", 0);
+    veCVar::get("other", "1", 0);
+    vvarTestClearLog();
+    veCVar::list("keep*");
+    EXPECT_TRUE(logContains("keepme"));
+    EXPECT_FALSE(logContains("other"));
+}
+
+// ------------------------------- commandCompletion (cvars) --------------------------------
+UTEST(veCVar_y, commandCompletion_visits_cvars) {
+    resetVvarForTest();
+    veCVar::get("cc_test", "1", 0);
+    bool seen = false;
+    veCVar::commandCompletion([&seen](const char* s) {
+        if (std::string(s) == "cc_test") seen = true;
+    });
+    EXPECT_TRUE(seen);
+}
+
+// ------------------------------- cmd registry helpers --------------------------------
+UTEST(veCmd_y, addCommand_duplicate_warns) {
+    resetVvarForTest();
+    veGetCmd().addCommand("dupwarn", [](){});
+    vvarTestClearLog();
+    veGetCmd().addCommand("dupwarn", [](){});
+    EXPECT_TRUE(logContains("already defined"));
+}
+
+UTEST(veCmd_y, removeCommand_nonexistent_no_crash) {
+    resetVvarForTest();
+    veGetCmd().removeCommand("never_existed");
+    SUCCEED();
+}
+
+UTEST(veCmd_y, getArgvIdx_and_len) {
+    resetVvarForTest();
+    veGetCmd().tokenizeString("aa bbb");
+    EXPECT_EQ(0, veGetCmd().getArgvIdx(0));
+    EXPECT_EQ(-1, veGetCmd().getArgvIdx(9));
+    EXPECT_EQ(2, veGetCmd().getArgvLen(0));
+    EXPECT_EQ(3, veGetCmd().getArgvLen(1));
+}
+
+// ------------------------------- cmdlist filter --------------------------------
+UTEST(veCmd_y, cmdlist_filter_match) {
+    resetVvarForTest();
+    veGetCmd().addCommand("zzspecial", [](){});
+    vvarTestClearLog();
+    veGetCmd().executeString("cmdlist zz*");
+    EXPECT_TRUE(logContains("zzspecial"));
+}
+
+// ------------------------------- multiple waits + buffering --------------------------------
+UTEST(veCmd_y, two_waits_delay_two_frames) {
+    resetVvarForTest();
+    int count = 0;
+    veGetCmd().addCommand("inc", [&count]() { count++; });
+    veGetCmd().execute(VE_CMD_EXEC_APPEND, "inc\nwait\nwait\ninc\n");
+    veGetCmd().execute(VE_CMD_EXEC_NOW);
+    EXPECT_EQ(1, count);
+    veGetCmd().execute(VE_CMD_EXEC_NOW);
+    EXPECT_EQ(1, count); // second wait still pending
+    veGetCmd().execute(VE_CMD_EXEC_NOW);
+    EXPECT_EQ(2, count);
+}
+
+UTEST(veCmd_y, wait_negative_arg_becomes_one) {
+    resetVvarForTest();
+    veGetCmd().executeString("wait -5");
+    EXPECT_EQ(1, veGetCmd().getWait());
+}
+
+// ------------------------------- exec nested --------------------------------
+UTEST(veCmd_y, exec_nested_files) {
+    resetVvarForTest();
+    {
+        std::ofstream a("vvar_nested_a.cfg", std::ios::trunc);
+        a << "exec vvar_nested_b.cfg\nset from_a 1\n";
+    }
+    {
+        std::ofstream b("vvar_nested_b.cfg", std::ios::trunc);
+        b << "set from_b 2\n";
+    }
+    veGetCmd().executeString("exec vvar_nested_a.cfg");
+    EXPECT_EQ(1, veCVar::variableIntegerValue("from_a"));
+    EXPECT_EQ(2, veCVar::variableIntegerValue("from_b"));
+    std::remove("vvar_nested_a.cfg");
+    std::remove("vvar_nested_b.cfg");
+}
+
+// ------------------------------- info string with spaces --------------------------------
+UTEST(veIVar_y, value_with_spaces_roundtrip) {
+    resetVvarForTest();
+    veIVar::set("s", "motd", "hello world");
+    std::string out = veIVar::toString("s");
+    EXPECT_TRUE(out.find("\\motd\\hello world") != std::string::npos);
+    veIVar::fromString("s2", out.c_str());
+    EXPECT_STREQ("hello world", veIVar::get("s2", "motd"));
+}
+
+// ------------------------------- executeString leading newline / crlf --------------------------------
+UTEST(veCmd_y, executeString_crlf_lines) {
+    resetVvarForTest();
+    int count = 0;
+    veGetCmd().addCommand("inc", [&count]() { count++; });
+    veGetCmd().executeString("inc\r\ninc\r\n");
+    EXPECT_EQ(2, count);
+}
+
+// ------------------------------- toggle nothing-to-toggle-to --------------------------------
+UTEST(veCVarCmd_y, toggle_single_value_arg_reports) {
+    resetVvarForTest();
+    veCVar::get("v", "a", 0);
+    vvarTestClearLog();
+    veGetCmd().executeString("toggle v onlyone");
+    EXPECT_TRUE(logContains("nothing to toggle"));
+}
+
+// ------------------------------- reset command usage --------------------------------
+UTEST(veCVarCmd_y, reset_wrong_args_usage) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("reset");
+    EXPECT_TRUE(logContains("usage: reset"));
+}
+
+// =====================================================================================
+// ======================= Compatibility behavior regression tests =======================
+// =====================================================================================
+
+UTEST(compatibility, exec_usage_includes_filename_placeholder) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("exec");
+    EXPECT_TRUE(logContains("usage: exec <filename>"));
+}
+
+UTEST(compatibility, cvarlist_filtered_output_total_counts_all_cvars) {
+    resetVvarForTest();
+    veCVar::get("mini_keep", "1", 0);
+    veCVar::get("mini_other", "2", 0);
+    vvarTestClearLog();
+    veGetCmd().executeString("cvarlist mini_keep");
+    EXPECT_TRUE(logContains("mini_keep"));
+    EXPECT_FALSE(logContains("mini_other \"2\""));
+    // Total reports all registered cvars, not only filtered rows. Includes sv_cheats.
+    EXPECT_TRUE(logContains("3 total cvars"));
+}
+
+UTEST(compatibility, cvar_modified_filtered_total_counts_all_modified_cvars) {
+    resetVvarForTest();
+    veCVar::get("mini_mod_keep", "0", 0);
+    veCVar::get("mini_mod_other", "0", 0);
+    veCVar::set("mini_mod_keep", "1");
+    veCVar::set("mini_mod_other", "1");
+    vvarTestClearLog();
+    veGetCmd().executeString("cvar_modified mini_mod_keep");
+    EXPECT_TRUE(logContains("mini_mod_keep"));
+    EXPECT_FALSE(logContains("mini_mod_other \"1\""));
+    // Total reports all modified cvars, not only filtered rows.
+    EXPECT_TRUE(logContains("2 total modified cvars"));
+}
+
+UTEST(compatibility, command_buffer_semicolon_inside_single_quotes_still_splits) {
+    resetVvarForTest();
+    vvarTestClearLog();
+    veGetCmd().executeString("echo 'a;b'");
+    EXPECT_TRUE(logContains("a\n"));
+    EXPECT_FALSE(logContains("a;b\n"));
 }
 
 UTEST_MAIN()
