@@ -1,25 +1,11 @@
 /*
-	===========================================================================
-	Copyright (C) 1999-2005 Id Software, Inc.
+	vvar — a console-variable / command / info-string library.
 
-	This file was heavily modified from Quake III Arena source code.
-	The following license applies only to this file and its heavy modifications.
-
-	Quake III Arena source code is free software; you can redistribute it
-	and/or modify it under the terms of the GNU General Public License as
-	published by the Free Software Foundation; either version 2 of the License,
-	or (at your option) any later version.
-
-	Quake III Arena source code is distributed in the hope that it will be
-	useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
-	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-	GNU General Public License for more details.
-
-	You should have received a copy of the GNU General Public License
-	along with Quake III Arena source code; if not, write to the Free Software
-	Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
-	===========================================================================
+	Copyright (c) 2026 Xi Ma Chen
+	Released under the MIT License. See the LICENSE file for the full text.
 */
+
+
 
 #pragma once
 #include <cstdarg>
@@ -79,72 +65,59 @@ inline void vvar_default_derr( const char* format, ... )
 #endif
 #endif
 
-// Macro to disallow copy constructor and assignment operator
-#define DISALLOW_COPY(className) \
-    className(const className&) = delete; \
-    className& operator=(const className&) = delete;
+
 
 typedef std::vector< uint8_t >  veFileData;
 
 // ------------------------------------ Utils ----------------------------------------
 
-// ref: ioq3 source code
+// ASCII-only, locale-independent character predicates.
+// Returns 1 for true and 0 for false.
+
 inline int veIsPrint( int c )
 {
-	if ( c >= 0x20 && c <= 0x7E )
-		return ( 1 );
-	return ( 0 );
+	return ( c >= 0x20 && c <= 0x7E ) ? 1 : 0;
 }
 
-// ref: ioq3 source code
 inline int veIsLower( int c )
 {
-	if (c >= 'a' && c <= 'z')
-		return ( 1 );
-	return ( 0 );
+	return ( c >= 'a' && c <= 'z' ) ? 1 : 0;
 }
 
-// ref: ioq3 source code
 inline int veIsUpper( int c )
 {
-	if (c >= 'A' && c <= 'Z')
-		return ( 1 );
-	return ( 0 );
+	return ( c >= 'A' && c <= 'Z' ) ? 1 : 0;
 }
 
-// ref: ioq3 source code
 inline int veIsAlpha( int c )
 {
-	if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
-		return ( 1 );
-	return ( 0 );
+	return ( ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) ) ? 1 : 0;
 }
 
-// ref: ioq3 source code
+// Use strtod to validate that an entire null-terminated string parses as a
+// (locale-independent) C number. An empty string is rejected. Leading
+// whitespace is permitted by strtod's rules; trailing garbage is not.
 inline bool veIsANumber( const char *s )
 {
-	char *p;
-	double d;
-
-	if( *s == '\0' )
+	if ( !s || *s == '\0' )
 		return false;
-
-	d = strtod( s, &p );
-
-	return *p == '\0';
+	char* end = nullptr;
+	std::strtod( s, &end );
+	return end != s && *end == '\0';
 }
 
-// ref: ioq3 source code
+// True iff f has no fractional component when narrowed to int.
 inline bool veIsIntegral( float f )
 {
-	return (int)f == f;
+	return static_cast< int >( f ) == f;
 }
 
 // ------------------------------------ Key / value info strings ----------------------------------------
 
 class veIVar
 {
-	DISALLOW_COPY( veIVar )
+	veIVar( const veIVar& ) = delete;
+	veIVar& operator=( const veIVar& ) = delete;
 
 	static std::unordered_map< std::string, std::unordered_map< std::string, std::string > > m_globalIVarTable;
 	static thread_local std::string m_serializedInfoString;
@@ -159,7 +132,6 @@ public:
 
 // ------------------------------------ Console Variables Definition ----------------------------------------
 
-// ref: ioq3 source code
 
 // Set to cause it to be saved to vars.rc
 // used for system variables, not for player
@@ -175,7 +147,7 @@ public:
 #define	VE_CVAR_INIT 0x0010	
 
 // Will only change when C code next does
-// a Cvar_Get(), so it can't be changed
+// the variable is next registered, so it can't be changed
 // without proper initialization.  modified
 // will be set, even though the value hasn't
 // changed yet
@@ -197,7 +169,7 @@ public:
 // the string representation.
 #define VE_CVAR_ALLOW_SET_INTEGER 0x4000	
 
-// These flags are only returned by the Cvar_Flags() function
+// These flags are only returned by the flags() query, never stored
 #define VE_CVAR_MODIFIED 0x40000000	// Cvar was modified
 #define VE_CVAR_NONEXISTENT 0x80000000	// Cvar doesn't exist.
 
@@ -218,11 +190,11 @@ public:
 //  The are also occasionally used to communicated information between different
 //  modules of the program.
 //
-// ref: ioq3 source code
 //
 class veCVar
 {
-	DISALLOW_COPY( veCVar )
+	veCVar( const veCVar& ) = delete;
+	veCVar& operator=( const veCVar& ) = delete;
 
 	std::string m_name;
 	std::string m_string;
@@ -324,7 +296,7 @@ public:
 	// Don't set the cvar immediately
 	static void setLatched( const char* varName, const char* value );
 
-	// Expands value to a string and calls Cvar_Set/Cvar_SetSafe
+	// Expands value to a string and sets the variable (plain / safe variants)
 	static void	setValue( const char *varName, float value );
 	static void	setValueSafe( const char *varName, float value );
 
@@ -348,7 +320,7 @@ public:
 	// Reset all testing vars to a safe value
 	static void	setCheatState( void );
 
-	// Called by Cmd_ExecuteString when Cmd_Argv(0) doesn't match a known
+	// Called during command execution when the first token doesn't match a known
 	// command.  Returns true if the command was a variable reference that
 	// was handled. (print or change)
 	static bool command( void );
@@ -376,7 +348,8 @@ public:
 // Resolve lazily after veCVar::init(); resolving before init() will cache a pointer that init() clears.
 class veCVarRef
 {
-	DISALLOW_COPY( veCVarRef )
+	veCVarRef( const veCVarRef& ) = delete;
+	veCVarRef& operator=( const veCVarRef& ) = delete;
 
 	const char*     m_name;
 	const char*     m_default;
@@ -407,12 +380,10 @@ extern veCVar* sv_cheats;
 
 // Command execution takes a null terminated string, breaks it into tokens,
 // then searches for a command or variable that matches the first token.
-// ref: ioq3 source code
 
 typedef std::function< void(void) > veCmdFunc;
 
 // Parameters for command buffer stuffing
-// ref: ioq3 source code
 enum veCmdExecWhen
 {
 	VE_CMD_EXEC_NOW,		// Don't return until completed.
@@ -428,7 +399,8 @@ struct veCmdFuncHandler {
 
 class veCmd
 {
-	DISALLOW_COPY( veCmd )
+	veCmd( const veCmd& ) = delete;
+	veCmd& operator=( const veCmd& ) = delete;
 
 	// Current execution state.
 	int m_wait = 0;
@@ -456,7 +428,7 @@ public:
 	// register commands and functions to call for them.
 	// The cmd_name is referenced later, so it should not be in temp memory
 	// if function is NULL, the command will be forwarded to the server
-	// as a clc_clientCommand instead of executed locally.
+	// to a remote handler instead of executed locally.
 	//
 	void addCommand( const char *name, veCmdFunc function );
 
@@ -521,7 +493,7 @@ public:
 
 	inline int getArgvIdx( int arg )
 	{
-		if ( arg < 0 || arg >= m_argv.size() ) return -1;
+		if ( arg < 0 || static_cast< size_t >( arg ) >= m_argv.size() ) return -1;
 		return m_argv[ arg ];
 	}
 

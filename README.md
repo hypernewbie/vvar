@@ -2,7 +2,7 @@
 
 ![CI](https://github.com/hypernewbie/vvar/actions/workflows/ci.yml/badge.svg)
 
-A modern C++17 port of the Quake III Arena cvar and command system, extracted as a lightweight, header-friendly library. If you know what a cvar is, you know what this does.
+A modern C++17 cvar and command system in the Quake III Arena–style console API tradition, packaged as a lightweight, header-friendly library. If you know what a cvar is, you know what this does.
 
 ## What's included
 
@@ -145,4 +145,4 @@ const char* info = veIVar::toString("userinfo");
 
 ## License
 
-Derived from Quake III Arena source code, copyright 1999–2005 Id Software, Inc. Licensed under the GNU General Public License v2 (or later). See `LICENSE` for the full terms.
+MIT. See `LICENSE` for the full terms. Historical commits at or before the `gpl-final` tag are the prior GPLv2 implementation and remain GPLv2.

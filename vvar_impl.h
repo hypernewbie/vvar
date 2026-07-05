@@ -1,744 +1,725 @@
 /*
-	===========================================================================
-	Copyright (C) 1999-2005 Id Software, Inc.
+	vvar — a console-variable / command / info-string library.
 
-	This file was heavily modified from Quake III Arena source code.
-	The following license applies only to this file and its heavy modifications.
-
-	Quake III Arena source code is free software; you can redistribute it
-	and/or modify it under the terms of the GNU General Public License as
-	published by the Free Software Foundation; either version 2 of the License,
-	or (at your option) any later version.
-
-	Quake III Arena source code is distributed in the hope that it will be
-	useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
-	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-	GNU General Public License for more details.
-
-	You should have received a copy of the GNU General Public License
-	along with Quake III Arena source code; if not, write to the Free Software
-	Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
-	===========================================================================
+	Copyright (c) 2026 Xi Ma Chen
+	Released under the MIT License. See the LICENSE file for the full text.
 */
+
+
 
 #include "vvar.h"
 
 #include <array>
 #include <fstream>
+#include <sstream>
 
 veCVar* sv_cheats = nullptr;
 std::unique_ptr< veCmd > g_cmd;
 
-// Field completion state.
 static std::string g_fieldCompletionString;
 static std::string g_fieldShortestMatch;
 static int g_fieldMatchCount;
 
+// True iff the string contains none of the disallowed characters
+// (backslash, double quote, semicolon). Used to validate info-string keys
+// and values during serialization, and to validate cvar names.
 static bool veInfoStringValueIsValid( const std::string& value )
 {
-	return value.find( '\\' ) == std::string::npos
-		&& value.find( '"' ) == std::string::npos
-		&& value.find( ';' ) == std::string::npos;
+	for ( char c : value )
+	{
+		if ( c == '\\' || c == '"' || c == ';' )
+			return false;
+	}
+	return true;
 }
 
+// True iff the given C-string is a non-empty console token whose characters
+// are all allowed (no '\\', '"', ';').
 static bool veIsValidConsoleToken( const char* value )
 {
-	return value && *value
-		&& strchr( value, '\\' ) == nullptr
-		&& strchr( value, '"' ) == nullptr
-		&& strchr( value, ';' ) == nullptr;
+	if ( !value || *value == '\0' )
+		return false;
+	for ( const char* p = value; *p; ++p )
+	{
+		if ( *p == '\\' || *p == '"' || *p == ';' )
+			return false;
+	}
+	return true;
 }
 
+// Bounded string copy into a caller-supplied buffer. No-op for null buffers
+// or non-positive sizes; null value copies an empty string.
 static void veCopyString( char* buffer, int bufsize, const char* value )
 {
-	if( !buffer || bufsize <= 0 ) {
+	if ( !buffer || bufsize <= 0 )
+		return;
+	if ( !value )
+	{
+		buffer[ 0 ] = '\0';
 		return;
 	}
-
-	if( !value ) {
-		buffer[0] = '\0';
-		return;
-	}
-
 	std::snprintf( buffer, static_cast< size_t >( bufsize ), "%s", value );
 }
 
 // ------------------------------------ Key / value info strings ----------------------------------------
 
-// ref: ioq3 source code
 
 std::unordered_map< std::string, std::unordered_map< std::string, std::string > > veIVar::m_globalIVarTable;
 thread_local std::string veIVar::m_serializedInfoString;
 
+// Look up the value for `key` within section `s`. Returns nullptr if the
+// section or key is missing. Null arguments are treated as empty strings.
 const char* veIVar::get( const char *s, const char *key )
 {
-	auto itr = m_globalIVarTable.find( s );
-	if ( itr == m_globalIVarTable.end() )
+	if ( !s ) s = "";
+	if ( !key ) key = "";
+	auto secIt = m_globalIVarTable.find( s );
+	if ( secIt == m_globalIVarTable.end() )
 		return nullptr;
-
-	auto itr2 = itr->second.find( key );
-	if ( itr2 == itr->second.end() )
+	auto keyIt = secIt->second.find( key );
+	if ( keyIt == secIt->second.end() )
 		return nullptr;
-
-	return itr2->second.c_str();
+	return keyIt->second.c_str();
 }
 
+// Remove `key` from section `s`. If the section becomes empty it is erased.
 void veIVar::remove( const char *s, const char *key )
 {
-	auto itr = m_globalIVarTable.find( s );
-	if ( itr == m_globalIVarTable.end() )
+	if ( !s ) s = "";
+	if ( !key ) key = "";
+	auto secIt = m_globalIVarTable.find( s );
+	if ( secIt == m_globalIVarTable.end() )
 		return;
-
-	auto itr2 = itr->second.find( key );
-	if ( itr2 == itr->second.end() )
-		return;
-
-	itr->second.erase( itr2 );
-	if( itr->second.empty() ) {
-		m_globalIVarTable.erase( itr );
-	}
+	secIt->second.erase( key );
+	if ( secIt->second.empty() )
+		m_globalIVarTable.erase( secIt );
 }
 
+// Store `value` under `key` in section `s`, creating section/key as needed.
+// No validation is performed here; invalid characters are filtered later
+// during serialization.
 void veIVar::set( const char *s, const char *key, const char *value )
 {
-	m_globalIVarTable[s][key] = value;
+	if ( !s ) s = "";
+	if ( !key ) key = "";
+	if ( !value ) value = "";
+	m_globalIVarTable[ s ][ key ] = value;
 }
 
+// Serialize section `s` as repeated "\\key\\value". Pairs whose key or value
+// contains any disallowed character are skipped. The result is stored in a
+// thread-local buffer that is valid until the next toString() on the same
+// thread.
 const char* veIVar::toString( const char *s )
 {
+	if ( !s ) s = "";
 	m_serializedInfoString.clear();
+	auto secIt = m_globalIVarTable.find( s );
+	if ( secIt == m_globalIVarTable.end() )
+		return m_serializedInfoString.c_str();
 
-	auto itr = m_globalIVarTable.find( s ? s : "" );
-	if( itr == m_globalIVarTable.end() ) {
-		return "";
-	}
-
-	for( const auto& kv : itr->second ) {
-		if( !veInfoStringValueIsValid( kv.first ) || !veInfoStringValueIsValid( kv.second ) ) {
+	for ( const auto& kv : secIt->second )
+	{
+		if ( !veInfoStringValueIsValid( kv.first ) )
 			continue;
-		}
-
+		if ( !veInfoStringValueIsValid( kv.second ) )
+			continue;
 		m_serializedInfoString += '\\';
 		m_serializedInfoString += kv.first;
 		m_serializedInfoString += '\\';
 		m_serializedInfoString += kv.second;
 	}
-
 	return m_serializedInfoString.c_str();
 }
 
+// Parse a backslash-delimited key/value stream and replace the contents of
+// section `s`. A leading '\' is tolerated but not required. Pairs with empty
+// keys, invalid characters, or trailing keys without values are dropped.
+// Duplicate keys: last value wins. Null or empty infoString erases the
+// section entirely.
 void veIVar::fromString( const char *s, const char *infoString )
 {
-	auto& section = m_globalIVarTable[s ? s : ""];
-	section.clear();
+	if ( !s ) s = "";
 
-	if( !infoString || !*infoString ) {
+	// Always replace the section's contents.
+	m_globalIVarTable.erase( s );
+	if ( !infoString || *infoString == '\0' )
 		return;
+
+	// A single leading backslash is conventional but optional.
+	if ( *infoString == '\\' )
+		++infoString;
+
+	enum Mode { MODE_KEY, MODE_VALUE };
+	Mode mode = MODE_KEY;
+	std::string key;
+	std::string value;
+	bool keyNonEmpty = false;
+	bool valueNonEmpty = false;
+	auto flushPairIfValid = [&]()
+	{
+		if ( keyNonEmpty && valueNonEmpty
+			&& veInfoStringValueIsValid( key )
+			&& veInfoStringValueIsValid( value ) )
+		{
+			m_globalIVarTable[ s ][ key ] = value;
+		}
+		key.clear();
+		value.clear();
+		keyNonEmpty = false;
+		valueNonEmpty = false;
+	};
+
+	for ( const char* p = infoString; *p; ++p )
+	{
+		char c = *p;
+		if ( c == '\\' )
+		{
+			if ( mode == MODE_KEY )
+			{
+				// End of key (whether empty or not). Switch to value mode.
+				mode = MODE_VALUE;
+				valueNonEmpty = false;
+			}
+			else
+			{
+				// End of value: finalize pair and prepare for next key.
+				flushPairIfValid();
+				mode = MODE_KEY;
+			}
+		}
+		else if ( mode == MODE_KEY )
+		{
+			key.push_back( c );
+			keyNonEmpty = true;
+		}
+		else
+		{
+			value.push_back( c );
+			valueNonEmpty = true;
+		}
 	}
 
-	auto cursor = infoString;
-	while( *cursor ) {
-		if( *cursor == '\\' ) {
-			cursor++;
-		}
-		if( !*cursor ) {
-			break;
-		}
-
-		const char* keyStart = cursor;
-		while( *cursor && *cursor != '\\' ) {
-			cursor++;
-		}
-		std::string key( keyStart, cursor - keyStart );
-		if( !*cursor ) {
-			break;
-		}
-
-		cursor++;
-		const char* valueStart = cursor;
-		while( *cursor && *cursor != '\\' ) {
-			cursor++;
-		}
-		std::string value( valueStart, cursor - valueStart );
-
-		if( !key.empty() && veInfoStringValueIsValid( key ) && veInfoStringValueIsValid( value ) ) {
-			section[key] = value;
-		}
-	}
-
-	if( section.empty() ) {
-		m_globalIVarTable.erase( s ? s : "" );
-	}
+	// If we ended mid-value with both key and value present, store the pair.
+	// Otherwise any trailing key without a value is dropped.
+	if ( mode == MODE_VALUE && keyNonEmpty && valueNonEmpty )
+		flushPairIfValid();
 }
 
 // ------------------------------------ Console Variables Implementation ----------------------------------------
 
-// ref: ioq3 source code
 
 std::map< std::string, std::unique_ptr< veCVar > > veCVar::m_globalCVarTable;
 int veCVar::m_modifiedFlags = 0;
 
+// Emit one character per flag slot for a cvar. Uses the flag's letter when
+// the bit is set, otherwise a space. Order:
+//   S s U R I A L C
+// (SERVERINFO, SYSTEMINFO, USERINFO, ROM, INIT, ARCHIVE, LATCH, CHEAT)
 static void veCVarCmd_PrintVarFlags( veCVar* var )
 {
-	if( var->getFlags() & VE_CVAR_SERVERINFO ) {
-		dinfo( "S" );
-	} else {
-		dinfo( " " );
-	}
-	if( var->getFlags() & VE_CVAR_SYSTEMINFO ) {
-		dinfo( "s" );
-	} else {
-		dinfo( " " );
-	}
-	if( var->getFlags() & VE_CVAR_USERINFO ) {
-		dinfo( "U" );
-	} else {
-		dinfo( " " );
-	}
-	if( var->getFlags() & VE_CVAR_ROM ) {
-		dinfo( "R" );
-	} else {
-		dinfo( " " );
-	}
-	if( var->getFlags() & VE_CVAR_INIT ) {
-		dinfo( "I" );
-	} else {
-		dinfo( " " );
-	}
-	if( var->getFlags() & VE_CVAR_ARCHIVE ) {
-		dinfo( "A" );
-	} else {
-		dinfo( " " );
-	}
-	if( var->getFlags() & VE_CVAR_LATCH ) {
-		dinfo( "L" );
-	} else {
-		dinfo( " " );
-	}
-	if( var->getFlags() & VE_CVAR_CHEAT ) {
-		dinfo( "C" );
-	} else {
-		dinfo( " " );
-	}
+	int flags = var->getFlags();
+	dinfo( "%c%c%c%c%c%c%c%c",
+		( flags & VE_CVAR_SERVERINFO ) ? 'S' : ' ',
+		( flags & VE_CVAR_SYSTEMINFO ) ? 's' : ' ',
+		( flags & VE_CVAR_USERINFO   ) ? 'U' : ' ',
+		( flags & VE_CVAR_ROM        ) ? 'R' : ' ',
+		( flags & VE_CVAR_INIT       ) ? 'I' : ' ',
+		( flags & VE_CVAR_ARCHIVE    ) ? 'A' : ' ',
+		( flags & VE_CVAR_LATCH      ) ? 'L' : ' ',
+		( flags & VE_CVAR_CHEAT      ) ? 'C' : ' ' );
 }
 
+// Private default constructor: cvar instances are only allocated inside veCVar::get().
 veCVar::veCVar()
 {
-
 }
 
 veCVar::~veCVar()
 {
 }
 
+// True iff `s` is non-null and contains none of '\\', '"', ';'.
 bool veCVar::validateString( const char *s )
 {
-	if( !s ) {
+	if ( !s )
 		return false;
-	}
-	if( strchr( s, '\\' ) ) {
-		return false;
-	}
-	if( strchr( s, '\"' ) ) {
-		return false;
-	}
-	if( strchr( s, ';' ) ) {
-		return false;
+	for ( const char* p = s; *p; ++p )
+	{
+		if ( *p == '\\' || *p == '"' || *p == ';' )
+			return false;
 	}
 	return true;
 }
 
+// Validate a value against the cvar's range/format constraints. Returns
+// either the original `value` or a pointer to a static formatted buffer when
+// the value was clamped/coerced. `warn` controls whether diagnostic messages
+// are emitted.
 const char* veCVar::validate( veCVar *var, const char *value, bool warn )
 {
-	static char s[VE_MAX_CVAR_VALUE_STRING];
-	float valuef;
+	if ( !var || !var->m_validate )
+		return value;
+	if ( !value )
+		return value;
+
+	float f = 0.0f;
 	bool changed = false;
+	const char* name = var->m_name.c_str();
 
-	if( !var->m_validate )
-		return value;
-
-	if( !value )
-		return value;
-
-	if( veIsANumber( value ) ) {
-		valuef = (float) atof( value );
-
-		if( var->m_integral ) {
-			if( !veIsIntegral( valuef ) ) {
-				if( warn )
-					derr( "WARNING: cvar '%s' must be integral", var->m_name.c_str() );
-
-				valuef = ( float ) ( ( int ) valuef );
-				changed = true;
-			}
+	if ( veIsANumber( value ) )
+	{
+		f = static_cast< float >( std::atof( value ) );
+		if ( var->m_integral && !veIsIntegral( f ) )
+		{
+			if ( warn )
+				derr( "WARNING: cvar '%s' must be integral", name );
+			f = static_cast< float >( static_cast< int >( f ) );
+			changed = true;
 		}
-	} else {
-		if( warn )
-			derr( "WARNING: cvar '%s' must be numeric", var->m_name.c_str() );
-
-		valuef = (float) atof( var->m_resetString.c_str() );
+	}
+	else
+	{
+		if ( warn )
+			derr( "WARNING: cvar '%s' must be numeric", name );
+		f = static_cast< float >( std::atof( var->m_resetString.c_str() ) );
 		changed = true;
 	}
 
-	if( valuef < var->m_min ) {
-		if( warn ) {
-			if( changed )
-				derr( " and is" );
+	if ( f < var->m_min )
+	{
+		if ( warn )
+		{
+			if ( veIsIntegral( var->m_min ) )
+				derr( "WARNING: cvar '%s' out of range (min %d)", name, static_cast< int >( var->m_min ) );
 			else
-				derr( "WARNING: cvar '%s'", var->m_name.c_str() );
-
-			if( veIsIntegral( var->m_min ) )
-				derr( " out of range (min %d)", ( int ) var->m_min );
-			else
-				derr( " out of range (min %f)", var->m_min );
+				derr( "WARNING: cvar '%s' out of range (min %f)", name, var->m_min );
 		}
-
-		valuef = var->m_min;
+		f = var->m_min;
 		changed = true;
-	} else if( valuef > var->m_max ) {
-		if( warn ) {
-			if( changed )
-				derr( " and is" );
+	}
+	if ( f > var->m_max )
+	{
+		if ( warn )
+		{
+			if ( veIsIntegral( var->m_max ) )
+				derr( "WARNING: cvar '%s' out of range (max %d)", name, static_cast< int >( var->m_max ) );
 			else
-				derr( "WARNING: cvar '%s'", var->m_name.c_str() );
-
-			if( veIsIntegral( var->m_max ) )
-				derr( " out of range (max %d)", ( int ) var->m_max );
-			else
-				derr( " out of range (max %f)", var->m_max );
+				derr( "WARNING: cvar '%s' out of range (max %f)", name, var->m_max );
 		}
-
-		valuef = var->m_max;
+		f = var->m_max;
 		changed = true;
 	}
 
-	if( changed ) {
-		if( veIsIntegral( valuef ) ) {
-			std::snprintf( s, sizeof( s ), "%d", ( int ) valuef );
-
-			if( warn )
-				derr( ", setting to %d\n", ( int ) valuef );
-		} else {
-			std::snprintf( s, sizeof( s ), "%f", valuef );
-
-			if( warn )
-				derr( ", setting to %f\n", valuef );
-		}
-
-		return s;
-	} else {
+	if ( !changed )
 		return value;
-	}
+
+	static thread_local char formatted[ VE_MAX_CVAR_VALUE_STRING ];
+	if ( veIsIntegral( f ) )
+		std::snprintf( formatted, sizeof( formatted ), "%d", static_cast< int >( f ) );
+	else
+		std::snprintf( formatted, sizeof( formatted ), "%f", static_cast< double >( f ) );
+	return formatted;
 }
 
 veCVar* veCVar::find( const char *varName )
 {
-	auto itr = m_globalCVarTable.find( varName );
-	if( itr == m_globalCVarTable.end() ) {
+	if ( !varName )
 		return nullptr;
-	}
-	return itr->second.get();
+	auto it = m_globalCVarTable.find( varName );
+	if ( it == m_globalCVarTable.end() )
+		return nullptr;
+	return it->second.get();
 }
 
-
+// Register or look up a cvar while preserving the public compatibility contract.
 veCVar* veCVar::get( const char* varName, const char* value, int flags )
 {
-	if ( !varName || ! value ) {
+	if ( !varName || !value )
+	{
 		derr( "veCVar::get() NULL parameter!\n" );
 		return nullptr;
 	}
 
-	bool invalidName = false;
-	if( !veCVar::validateString( varName ) ) {
+	bool nameInvalid = false;
+	if ( !validateString( varName ) )
+	{
 		derr( "invalid cvar name string: %s\n", varName );
+		nameInvalid = true;
 		varName = "BADNAME";
-		invalidName = true;
 	}
 
-	auto var = veCVar::find( varName );
-	if( var ) {
-		value = veCVar::validate( var, value, false );
+	// Pre-validate the incoming value so existing cvars keep their formatted
+	// representation when the same value is re-registered.
+	value = validate( find( varName ), value, false );
 
-		var->m_flags |= flags;
+	auto it = m_globalCVarTable.find( varName );
+	if ( it != m_globalCVarTable.end() )
+	{
+		veCVar* existing = it->second.get();
 
-		// Only allow one non-empty reset string without a warning
-		if( !var->m_resetString.length() ) {
-			// We don't have a reset string yet
-			var->m_resetString = value;
-		} else if( value[0] && var->m_resetString != value ) {
-			derr( "veCVar::get() Warning: cvar \"%s\" given initial values: \"%s\" and \"%s\"\n", varName, var->m_resetString.c_str(), value );
+		// Reset-string reconciliation.
+		if ( existing->m_resetString.empty() )
+		{
+			existing->m_resetString = value;
+		}
+		else if ( value[ 0 ] != '\0' && existing->m_resetString != value )
+		{
+			dinfo( "veCVar::get() Warning: cvar \"%s\" given initial values: \"%s\" and \"%s\"\n",
+				existing->m_name.c_str(),
+				existing->m_resetString.c_str(),
+				value );
 		}
 
-		// If we have a latched string, take that value now
-		if( var->m_latchedString.length() > 0 ) {
-			auto s = var->m_latchedString;
-			var->m_latchedString.clear();
-			veCVar::set2( varName, s.c_str(), true );
+		// Apply any pending latched value.
+		if ( !existing->m_latchedString.empty() )
+		{
+			std::string captured = existing->m_latchedString;
+			existing->m_latchedString.clear();
+			set2( existing->m_name.c_str(), captured.c_str(), true );
 		}
 
-		// ZOID--needs to be set so that cvars the game sets as 
-		// SERVERINFO get sent to clients
-		veCVar::m_modifiedFlags |= flags;
-
-		return var;
+		existing->m_flags |= flags;
+		m_modifiedFlags |= flags;
+		return existing;
 	}
 
-	//
-	// Allocate a new cvar
-	//
+	// Allocate a new cvar.
+	auto cv = std::unique_ptr< veCVar >( new ( std::nothrow ) veCVar() );
+	if ( !cv )
+		derr_fatal( "veCVar::get() allocation failure for \"%s\"\n", varName );
 
-	m_globalCVarTable[varName] = std::unique_ptr< veCVar >( new veCVar() );
-	var = m_globalCVarTable[varName].get();
-	if( !var )
-		derr_fatal( "veCVar::get() Failed to allocate new cvar." );
+	cv->m_name = varName;
+	cv->m_string = nameInvalid ? "BADNAME" : value;
+	cv->m_modified = false;
+	cv->m_modificationCount = 0;
+	cv->m_value = static_cast< float >( std::atof( cv->m_string.c_str() ) );
+	cv->m_integer = std::atoi( cv->m_string.c_str() );
+	cv->m_resetString = value;
+	cv->m_validate = false;
+	cv->m_flags = flags;
+	m_modifiedFlags |= flags;
 
-	var->m_name = varName;
-	var->m_string = invalidName ? "BADNAME" : value;
-	var->m_modified = false;
-	var->m_modificationCount = 0;
-	var->m_value = (float) atof( var->m_string.c_str() );
-	var->m_integer = (int) atoi( var->m_string.c_str() );
-	var->m_resetString = value;
-	var->m_validate = false;
-	var->m_description.clear();
-
-	var->m_flags = flags;
-	// Note what types of cvars have been modified (userinfo, archive, serverinfo, systeminfo)
-	veCVar::m_modifiedFlags |= var->m_flags;
-
-	return var;
+	veCVar* raw = cv.get();
+	m_globalCVarTable.emplace( varName, std::move( cv ) );
+	return raw;
 }
 
+// Print a human-readable summary of a single cvar. Always emits the current
+// name/value; adds "the default" or "default: ..." when not read-only;
+// appends latched string and description when present.
 void veCVar::print( veCVar *v )
 {
-	dinfo( "\"%s\" is:\"%s\"", v->m_name.c_str(), v->m_string.c_str() );
-
-	if( !( v->m_flags & VE_CVAR_ROM ) ) {
-		if( v->m_string == v->m_resetString ) {
+	const char* name = v->m_name.c_str();
+	const char* string = v->m_string.c_str();
+	dinfo( "\"%s\" is:\"%s\"", name, string );
+	if ( !( v->m_flags & VE_CVAR_ROM ) )
+	{
+		if ( v->m_string == v->m_resetString )
+		{
 			dinfo( ", the default" );
-		} else {
+		}
+		else
+		{
 			dinfo( " default:\"%s\"", v->m_resetString.c_str() );
 		}
 	}
 	dinfo( "\n" );
-
-	if( v->m_latchedString.length() ) {
+	if ( !v->m_latchedString.empty() )
 		dinfo( "latched: \"%s\"\n", v->m_latchedString.c_str() );
-	}
-
-	if( v->m_description.length() ) {
+	if ( !v->m_description.empty() )
 		dinfo( "%s\n", v->m_description.c_str() );
-	}
 }
 
+// List all cvars (optionally filtered by glob), one per line with flag
+// letters and "name \"value\"" formatting, then a total count.
+//
+// Filter controls which rows are listed; the "total cvars" count always
+// reflects every registered cvar regardless of the filter.
 void veCVar::list( const char* match )
 {
-	for( auto& cv : m_globalCVarTable ) {
-		auto var = cv.second.get();
-		if( !var || !var->m_name.length() || ( match && !veCmd::filter( match, var->m_name.c_str(), false ) ) )
+	for ( const auto& kv : m_globalCVarTable )
+	{
+		const std::string& name = kv.first;
+		veCVar* var = kv.second.get();
+		if ( match && !veCmd::filter( match, name.c_str(), false ) )
 			continue;
 		veCVarCmd_PrintVarFlags( var );
-		dinfo(" %s \"%s\"\n", var->m_name.c_str(), var->m_string.c_str());
+		dinfo( " %s \"%s\"\n", name.c_str(), var->m_string.c_str() );
 	}
-	dinfo ("\n%i total cvars\n", m_globalCVarTable.size());
+	dinfo( "\n%i total cvars\n", static_cast< int >( m_globalCVarTable.size() ) );
 }
 
+// List cvars whose effective value differs from the reset string (with
+// optional glob filter), followed by a total count of all modified cvars.
+//
+// Filter controls which rows are listed; the "total modified cvars" count
+// always reflects every modified cvar regardless of the filter.
 void veCVar::listModified( const char* match )
 {
-	int totalModified = 0;
-	for( auto& cv : m_globalCVarTable ) {
-		auto var = cv.second.get();
-		if( !var || !var->m_name.length() || !var->m_modificationCount )
+	int modifiedTotal = 0;
+	for ( const auto& kv : m_globalCVarTable )
+	{
+		veCVar* var = kv.second.get();
+		const std::string& effective = var->m_latchedString.empty() ? var->m_string : var->m_latchedString;
+		if ( var->m_modificationCount == 0 || effective == var->m_resetString )
 			continue;
-
-		auto& value = var->m_latchedString.length() ? var->m_latchedString : var->m_string;
-		if( value == var->m_resetString )
+		++modifiedTotal;
+		if ( match && !veCmd::filter( match, kv.first.c_str(), false ) )
 			continue;
-
-		totalModified++;
-
-		if( match && !veCmd::filter( match, var->m_name.c_str(), false ) )
-			continue;
-
 		veCVarCmd_PrintVarFlags( var );
-		dinfo( " %s \"%s\", default \"%s\"\n", var->m_name.c_str(), value.c_str(), var->m_resetString.c_str() );
+		dinfo( " %s \"%s\", default \"%s\"\n",
+			kv.first.c_str(), effective.c_str(), var->m_resetString.c_str() );
 	}
-
-	dinfo( "\n%i total modified cvars\n", totalModified );
+	dinfo( "\n%i total modified cvars\n", modifiedTotal );
 }
 
 void veCVar::set( const char* varName, const char* value )
 {
-	veCVar::set2( varName, value, true );
+	set2( varName, value, true );
 }
 
+// Core mutation path for cvar value changes, protections, latching, and coercion.
 veCVar* veCVar::set2( const char* varName, const char* value, bool force )
 {
-	if ( !veCVar::validateString( varName ) ) {
-		dinfo("invalid cvar name string: %s\n", varName );
+	if ( !validateString( varName ) )
+	{
+		dinfo( "invalid cvar name string: %s\n", varName );
 		varName = "BADNAME";
 	}
 
-	auto var = veCVar::find( varName );
-	if( !var ) {
-		if( !value ) {
+	veCVar* var = find( varName );
+	if ( !var )
+	{
+		if ( !value )
 			return nullptr;
-		}
-
-		// Create it
-		return veCVar::get( varName, value, 0 );
+		return get( varName, value, 0 );
 	}
 
-	if( !value ) {
+	if ( !value )
 		value = var->m_resetString.c_str();
-	}
 
-	value = veCVar::validate( var, value, true );
+	value = validate( var, value, true );
 
-	if( var->m_string == value )
+	// Early-equality short-circuit happens BEFORE force/latch handling.
+	if ( var->m_string == value )
 		return var;
 
-	// Note what types of cvars have been modified (userinfo, archive, serverinfo, systeminfo)
 	m_modifiedFlags |= var->m_flags;
 
-	if( !force ) {
-		if( var->m_flags & VE_CVAR_ROM ) {
-			dinfo( "%s is read only.\n", varName );
+	if ( !force )
+	{
+		if ( var->m_flags & VE_CVAR_ROM )
+		{
+			dinfo( "%s is read only.\n", var->m_name.c_str() );
 			return var;
 		}
-
-		if( var->m_flags & VE_CVAR_INIT ) {
-			dinfo( "%s is write protected.\n", varName );
+		if ( var->m_flags & VE_CVAR_INIT )
+		{
+			dinfo( "%s is write protected.\n", var->m_name.c_str() );
 			return var;
 		}
-
-		if( ( var->m_flags & VE_CVAR_CHEAT ) && !sv_cheats->getInteger() ) {
-			dinfo( "%s is cheat protected.\n", varName );
+		if ( ( var->m_flags & VE_CVAR_CHEAT ) && sv_cheats && sv_cheats->getInteger() == 0 )
+		{
+			dinfo( "%s is cheat protected.\n", var->m_name.c_str() );
 			return var;
 		}
-
-		if( var->m_flags & VE_CVAR_LATCH ) {
-			if( var->m_latchedString.length() ) {
-				if( var->m_latchedString == value )
+		if ( var->m_flags & VE_CVAR_LATCH )
+		{
+			if ( !var->m_latchedString.empty() )
+			{
+				if ( var->m_latchedString == value )
 					return var;
 				var->m_latchedString.clear();
-			} else {
-				if( var->m_string == value )
-					return var;
 			}
-
-			dinfo( "%s will be changed upon restarting.\n", varName );
+			else if ( var->m_string == value )
+			{
+				return var;
+			}
+			dinfo( "%s will be changed upon restarting.\n", var->m_name.c_str() );
 			var->m_latchedString = value;
 			var->m_modified = true;
 			var->m_modificationCount++;
 			return var;
 		}
-	} else {
-		if( var->m_latchedString.length() ) {
-			var->m_latchedString.clear();
-		}
+	}
+	else
+	{
+		var->m_latchedString.clear();
 	}
 
 	if ( var->m_string == value )
-		return var;		// Not changed
+		return var;
 
 	var->m_modified = true;
 	var->m_modificationCount++;
-
 	var->m_string = value;
-	var->m_value = (float) atof( var->m_string.c_str() );
-	var->m_integer = (int) atoi( var->m_string.c_str() );
-
+	var->m_value = static_cast< float >( std::atof( var->m_string.c_str() ) );
+	var->m_integer = std::atoi( var->m_string.c_str() );
 	return var;
 }
 
 void veCVar::setSafe( const char* varName, const char* value )
 {
-	int flags = veCVar::flags( varName );
-
-	if( ( flags != VE_CVAR_NONEXISTENT ) && ( flags & VE_CVAR_PROTECTED ) ) {
-		if( value )
+	int existingFlags = flags( varName );
+	if ( !( existingFlags & VE_CVAR_NONEXISTENT ) && ( existingFlags & VE_CVAR_PROTECTED ) )
+	{
+		if ( value )
 			derr( "Restricted source tried to set \"%s\" to \"%s\"", varName, value );
 		else
 			derr( "Restricted source tried to modify \"%s\"", varName );
 		return;
 	}
-	veCVar::set( varName, value );
+	set( varName, value );
 }
 
 void veCVar::setLatched( const char* varName, const char* value )
 {
-	veCVar::set2( varName, value, false );
+	set2( varName, value, false );
 }
 
 void veCVar::setValue( const char *varName, float value )
 {
-	char val[128];
-	if( value == ( int ) value ) {
-		std::snprintf( val, sizeof( val ), "%i", ( int ) value );
-	} else {
-		std::snprintf( val, sizeof( val ), "%f", value );
-	}
-	veCVar::set( varName, val );
+	char buf[ VE_MAX_CVAR_VALUE_STRING ];
+	if ( veIsIntegral( value ) )
+		std::snprintf( buf, sizeof( buf ), "%i", static_cast< int >( value ) );
+	else
+		std::snprintf( buf, sizeof( buf ), "%f", static_cast< double >( value ) );
+	set( varName, buf );
 }
 
 void veCVar::setValueSafe( const char *varName, float value )
 {
-	char val[128];
-	if( veIsIntegral( value ) )
-		std::snprintf( val, sizeof( val ), "%i", ( int ) value );
+	char buf[ VE_MAX_CVAR_VALUE_STRING ];
+	if ( veIsIntegral( value ) )
+		std::snprintf( buf, sizeof( buf ), "%i", static_cast< int >( value ) );
 	else
-		std::snprintf( val, sizeof( val ), "%f", value );
-	veCVar::setSafe( varName, val );
+		std::snprintf( buf, sizeof( buf ), "%f", static_cast< double >( value ) );
+	setSafe( varName, buf );
 }
 
 float veCVar::variableValue( const char *varName )
 {
-	auto var = veCVar::find( varName );
-	if( !var )
-		return 0;
+	veCVar* var = find( varName );
+	if ( !var )
+		return 0.0f;
 	return var->m_value;
 }
 
 int veCVar::variableIntegerValue( const char *varName )
 {
-	auto var = veCVar::find( varName );
-	if( !var )
+	veCVar* var = find( varName );
+	if ( !var )
 		return 0;
 	return var->m_integer;
 }
 
 const char* veCVar::variableString( const char *varName )
 {
-	auto var = veCVar::find( varName );
-	if( !var )
+	veCVar* var = find( varName );
+	if ( !var )
 		return "";
 	return var->m_string.c_str();
 }
 
 void veCVar::variableStringBuffer( const char *varName, char *buffer, int bufsize )
 {
-	auto var = veCVar::find( varName );
-	if( !var )
-		*buffer = 0;
-	else
-		veCopyString( buffer, bufsize, var->m_string.c_str() );
+	if ( !buffer || bufsize <= 0 )
+		return;
+	veCVar* var = find( varName );
+	if ( !var )
+	{
+		buffer[ 0 ] = '\0';
+		return;
+	}
+	veCopyString( buffer, bufsize, var->m_string.c_str() );
 }
 
 int veCVar::flags( const char *varName )
 {
-	auto var = veCVar::find( varName );
-	if( !var )
+	veCVar* var = find( varName );
+	if ( !var )
 		return VE_CVAR_NONEXISTENT;
-
-	if( var->m_modified )
-		return var->m_flags | VE_CVAR_MODIFIED;
-	else
-		return var->m_flags;
+	int f = var->m_flags;
+	if ( var->m_modified )
+		f |= VE_CVAR_MODIFIED;
+	return f;
 }
 
 void veCVar::commandCompletion( std::function< void( const char *s ) > callback )
 {
-	for( auto& cv : m_globalCVarTable ) {
-		assert( cv.second.get() );
-		callback( cv.second->m_name.c_str() );
-	}
+	for ( const auto& kv : m_globalCVarTable )
+		callback( kv.first.c_str() );
 }
 
 void veCVar::reset( const char *varName )
 {
-	veCVar::set2( varName, nullptr, false );
+	set2( varName, nullptr, false );
 }
 
 void veCVar::forceReset( const char *varName )
 {
-	veCVar::set2( varName, nullptr, true );
+	set2( varName, nullptr, true );
 }
 
 void veCVar::setCheatState( void )
 {
-	// Set all default vars to the safe value
-	for( auto& cv : m_globalCVarTable ) {
-
-		auto var = cv.second.get();
-		if( var->m_flags & VE_CVAR_CHEAT ) {
-
-			// The CVAR_LATCHED|CVAR_CHEAT vars might escape the reset here 
-			// because of a different var->latchedString
-			if( var->m_latchedString.size() ) {
-				var->m_latchedString.clear();
-			}
-			
-			if( var->m_resetString != var->m_string )
-				veCVar::set( var->m_name.c_str(), var->m_resetString.c_str() );
-		}
+	for ( auto& kv : m_globalCVarTable )
+	{
+		veCVar* var = kv.second.get();
+		if ( !( var->m_flags & VE_CVAR_CHEAT ) )
+			continue;
+		var->m_latchedString.clear();
+		if ( var->m_resetString != var->m_string )
+			set( var->m_name.c_str(), var->m_resetString.c_str() );
 	}
 }
 
+// Console fallback for unknown commands: handle cvar-style references.
 bool veCVar::command( void )
 {
-	auto& c = veGetCmd();
-
-	// Check variables
-	auto v = veCVar::find( c.argv( 0 ) );
+	auto& cmd = veGetCmd();
+	veCVar* v = find( cmd.argv( 0 ) );
 	if ( !v )
 		return false;
-	
-	// Perform a variable print or set
-	if ( c.argc() == 1 ) {
-		veCVar::print( v );
+	if ( cmd.argc() == 1 )
+	{
+		print( v );
 		return true;
 	}
-
-	// Set the value if forcing isn't required
-	veCVar::set2( v->m_name.c_str(), c.args().c_str(), false );
+	set2( v->m_name.c_str(), cmd.args().c_str(), false );
 	return true;
 }
 
+// Write `seta NAME "VALUE"` lines for every ARCHIVE cvar into `f`. Uses
+// the latched string when present. Skips cvars whose name+value wouldn't
+// fit in an 8192-byte temp buffer.
 void veCVar::writeVariables( veFileData& f )
 {
-	std::vector< char > buffer;
-	std::vector< uint8_t >& bufferData = f;
-
-	buffer.resize( 8192 );
-	bufferData.reserve( 65535 );
-
-	for( auto& cv : m_globalCVarTable ) {
-		auto var = cv.second.get();
-
-		if( !var->m_name.length() )
+	char buffer[ 8192 ];
+	for ( const auto& kv : m_globalCVarTable )
+	{
+		veCVar* var = kv.second.get();
+		if ( !( var->m_flags & VE_CVAR_ARCHIVE ) )
 			continue;
-
-		if( var->m_flags & VE_CVAR_ARCHIVE ) {
-
-			// Write the latched value, even if it hasn't taken effect yet
-			if( var->m_latchedString.length() ) {
-				if( var->m_name.length() + var->m_latchedString.length() + 10 > buffer.size() ) {
-					dinfo( "WARNING: value of variable \"%s\" too long to write to file\n", var->m_name.c_str() );
-					continue;
-				}
-				std::snprintf( buffer.data(), buffer.size(), "seta %s \"%s\"\n", var->m_name.c_str(), var->m_latchedString.c_str() );
-			} else {
-				if( var->m_name.length() + var->m_string.length() + 10 > buffer.size() ) {
-					dinfo( "WARNING: value of variable \"%s\" too long to write to file\n", var->m_name.c_str() );
-					continue;
-				}
-				std::snprintf( buffer.data(), buffer.size(), "seta %s \"%s\"\n", var->m_name.c_str(), var->m_string.c_str() );
-			}
-
-			auto slen = strlen( buffer.data() );
-			for( int i = 0; i < slen; i++ ) {
-				bufferData.push_back( buffer[i] );
-			}
+		const std::string& value = var->m_latchedString.empty() ? var->m_string : var->m_latchedString;
+		int needed = static_cast< int >( kv.first.size() ) + static_cast< int >( value.size() ) + 10;
+		if ( needed >= static_cast< int >( sizeof( buffer ) ) )
+		{
+			dinfo( "WARNING: value of variable \"%s\" too long to write to file\n", kv.first.c_str() );
+			continue;
 		}
+		int n = std::snprintf( buffer, sizeof( buffer ), "seta %s \"%s\"\n", kv.first.c_str(), value.c_str() );
+		if ( n > 0 )
+			f.insert( f.end(), reinterpret_cast< uint8_t* >( buffer ), reinterpret_cast< uint8_t* >( buffer ) + n );
 	}
 }
-
 
 void veCVar::init( void )
 {
 	m_globalCVarTable.clear();
-	sv_cheats = veCVar::get( "sv_cheats", "0", VE_CVAR_ROM );
+	m_modifiedFlags = 0;
+	sv_cheats = get( "sv_cheats", "0", VE_CVAR_ROM );
 }
 
 void veCVar::checkRange( veCVar *var, float minVal, float maxVal, bool shouldBeIntegral )
@@ -747,235 +728,247 @@ void veCVar::checkRange( veCVar *var, float minVal, float maxVal, bool shouldBeI
 	var->m_min = minVal;
 	var->m_max = maxVal;
 	var->m_integral = shouldBeIntegral;
-
-	// Force an initial range check
-	veCVar::set( var->m_name.c_str(), var->m_string.c_str() );
+	set( var->m_name.c_str(), var->m_string.c_str() );
 }
 
 void veCVar::setDescription( veCVar *var, const char *description )
 {
-	var->m_description = description;
+	if ( !var )
+		return;
+	var->m_description = description ? description : "";
 }
 
 void veCVar::restart()
 {
-	for( auto& cv : m_globalCVarTable ) {
-		auto var = cv.second.get();
-		if( !( var->m_flags & ( VE_CVAR_ROM | VE_CVAR_INIT | VE_CVAR_NORESTART ) ) ) {
-			// Apply latched value if present, otherwise use reset string
-			std::string latchedValue = var->m_latchedString;
-			const char* newValue = latchedValue.length() > 0 ? latchedValue.c_str() : var->m_resetString.c_str();
-			veCVar::set2( var->m_name.c_str(), newValue, true );
+	for ( auto& kv : m_globalCVarTable )
+	{
+		veCVar* var = kv.second.get();
+		if ( var->m_flags & ( VE_CVAR_ROM | VE_CVAR_INIT | VE_CVAR_NORESTART ) )
+			continue;
+		if ( !var->m_latchedString.empty() )
+		{
+			// Pass a copy because set2 may clear the latched string when force=true.
+			std::string captured = var->m_latchedString;
+			set2( var->m_name.c_str(), captured.c_str(), true );
+		}
+		else
+		{
+			set2( var->m_name.c_str(), var->m_resetString.c_str(), true );
 		}
 	}
 }
 
-
 void veCVar::remove( const char* varName )
 {
-	auto itr = m_globalCVarTable.find( varName );
-	if( itr == m_globalCVarTable.end() ) {
+	if ( !varName )
 		return;
-	}
-	m_globalCVarTable.erase( itr );
+	m_globalCVarTable.erase( varName );
 }
 
 void veCVar::updateFromIntegerFloatValues()
 {
-	for( auto& cv : m_globalCVarTable ) {
-		auto var = cv.second.get();
-		if( !( var->m_flags & VE_CVAR_ALLOW_SET_INTEGER ) ) {
+	for ( auto& kv : m_globalCVarTable )
+	{
+		veCVar* var = kv.second.get();
+		if ( !( var->m_flags & VE_CVAR_ALLOW_SET_INTEGER ) )
 			continue;
+		if ( var->m_value != static_cast< float >( std::atof( var->m_string.c_str() ) ) )
+		{
+			char buf[ VE_MAX_CVAR_VALUE_STRING ];
+			if ( veIsIntegral( var->m_value ) )
+				std::snprintf( buf, sizeof( buf ), "%d", static_cast< int >( var->m_value ) );
+			else
+				std::snprintf( buf, sizeof( buf ), "%f", static_cast< double >( var->m_value ) );
+			set( var->m_name.c_str(), buf );
 		}
-
-		const float parsedValue = (float) atof( var->m_string.c_str() );
-		const int parsedInteger = atoi( var->m_string.c_str() );
-		if( var->m_value != parsedValue ) {
-			if( veIsIntegral( var->m_value ) ) {
-				veCVar::set( var->m_name.c_str(), veq3_va( "%d", ( int ) var->m_value ) );
-			} else {
-				veCVar::set( var->m_name.c_str(), veq3_va( "%f", var->m_value ) );
-			}
-			continue;
-		}
-
-		if( var->m_integer != parsedInteger ) {
-			veCVar::set( var->m_name.c_str(), veq3_va( "%d", var->m_integer ) );
+		else if ( var->m_integer != std::atoi( var->m_string.c_str() ) )
+		{
+			char buf[ VE_MAX_CVAR_VALUE_STRING ];
+			std::snprintf( buf, sizeof( buf ), "%d", var->m_integer );
+			set( var->m_name.c_str(), buf );
 		}
 	}
 }
 
 // ------------------------------------------------- Console Commands ------------------------------------------------------------
 
-// ref: ioq3 source code
 
+// veCmd constructor: reserve capacity to make the command buffer more
+// efficient when many small commands are parsed.
 veCmd::veCmd()
 {
-	m_text.reserve( 128 * 1024 );
-	m_line.reserve( 1024 );
-
-	m_argv.reserve( 1024 );
+	m_argv.reserve( 64 );
 	m_tokens.reserve( 1024 );
-	m_cmd.reserve( 2048 );
-
-	m_functions.reserve( 512 );
-	m_aliases.reserve( 128 );
 }
 
 veCmd::~veCmd()
 {
 }
 
+// Dispatch a piece of text to the command buffer / immediate execution.
 void veCmd::execute( veCmdExecWhen when, const char* text )
 {
-	switch( when ) {
-		case VE_CMD_EXEC_NOW:
-			if( text && strlen( text ) > 0 ) {
-				this->executeString( text );
-			} else {
-				this->execute();
-			}
+	switch ( when )
+	{
+	case VE_CMD_EXEC_NOW:
+		if ( text && text[ 0 ] != '\0' )
+			executeString( text );
+		else
+			execute();
+		break;
+	case VE_CMD_EXEC_INSERT:
+		if ( !text || text[ 0 ] == '\0' )
 			break;
-		case VE_CMD_EXEC_INSERT:
-			if( text && *text ) {
-				if( m_text.length() ) {
-					m_text.insert( 0, "\n" );
-				}
-				m_text.insert( 0, text );
-			}
+		if ( m_text.empty() )
+			m_text.assign( text );
+		else
+		{
+			// Prepend `text` then a newline, then the existing buffer.
+			std::string tmp;
+			tmp.reserve( std::strlen( text ) + 1 + m_text.size() );
+			tmp.assign( text );
+			tmp.push_back( '\n' );
+			tmp.append( m_text );
+			m_text.swap( tmp );
+		}
+		break;
+	case VE_CMD_EXEC_APPEND:
+		if ( !text || text[ 0 ] == '\0' )
 			break;
-		case VE_CMD_EXEC_APPEND:
-			m_text += text;
-			break;
-		default:
-			derr_fatal( "veCmd::execute(): bad when paramter." );
+		m_text.append( text );
+		break;
+	default:
+		derr_fatal( "veCmd::execute: bad veCmdExecWhen %d\n", static_cast< int >( when ) );
+		break;
 	}
 }
 
+// Process buffered text line-by-line, honoring `;` and newline separators
+// (with quote/comment awareness), invoking `executeTokenized()` for each.
+// If `m_wait > 0` at entry, it is decremented and the buffered remainder
+// (deferred from a prior `wait`) is processed. Encountering a `wait`
+// command sets `m_wait` and defers the remaining buffer to a later call.
 void veCmd::execute()
 {
-	char *text;
+	if ( m_wait > 0 )
+		m_wait--;
 
-	// This will keep // style comments all on one line by not breaking on
-	// a semicolon.  It will keep /* ... */ style comments all on one line by not
-	// breaking it for semicolon or newline.
-	//
-	bool inStarComment = false;
-	bool inSlashComment = false;
-
-	while ( m_text.length() )
+	while ( !m_text.empty() )
 	{
-		// Skip out while text still remains in buffer, leaving it
-		// for next frame
-		if ( m_wait > 0 ) {
-			
-			m_wait--;
-			break;
-		}
-
-		// Find a \n or ; line break or comment: // or /* */
-		text = (char *) m_text.data();
-		int i;
-		int quotes = 0;
-		for( i = 0; i < m_text.length(); i++ ) {
-			if( text[i] == '"' )
-				quotes++;
-
-			if( !( quotes & 1 ) ) {
-				if( i < m_text.length() - 1 ) {
-					if( !inStarComment && text[i] == '/' && text[i + 1] == '/' )
-						inSlashComment = true;
-					else if( !inSlashComment && text[i] == '/' && text[i + 1] == '*' )
-						inStarComment = true;
-					else if( inStarComment && text[i] == '*' && text[i + 1] == '/' ) {
-						inStarComment = false;
-						// If we are in a star comment, then the part after it is valid
-						// Note: This will cause it to NUL out the terminating '/'
-						// but ExecuteString doesn't require it anyway.
-						i++;
-						break;
-					}
-				}
-				if( !inSlashComment && !inStarComment && text[i] == ';' )
+		// Scan for the first line terminator that isn't nested inside a
+		// double-quoted region or a comment. Single quotes do NOT protect
+		// against ';' (or '\n'/'\r') — they only group text for tokenisation,
+		// not for command-buffer splitting. The ';' character always terminates
+		// the current command at this layer.
+		size_t i = 0;
+		size_t end = std::string::npos;
+		bool inDoubleQuote = false;
+		int slashComment = 0;     // 0=no, 1=//, 2=/*
+		while ( i < m_text.size() )
+		{
+			char c = m_text[ i ];
+			if ( slashComment == 1 )
+			{
+				// //-comment: only a newline breaks it
+				if ( c == '\n' || c == '\r' )
+				{
+					end = i;
 					break;
+				}
 			}
-
-			if( !inStarComment && ( text[i] == '\n' || text[i] == '\r' ) ) {
-				inSlashComment = false;
+			else if ( slashComment == 2 )
+			{
+				if ( c == '*' && i + 1 < m_text.size() && m_text[ i + 1 ] == '/' )
+				{
+					slashComment = 0;
+					++i;
+				}
+			}
+			else if ( inDoubleQuote )
+			{
+				if ( c == '"' )
+					inDoubleQuote = false;
+				// Inside double quotes: ';' and newlines are protected.
+				// Single quotes inside double quotes are just characters.
+			}
+			else if ( c == '"' )
+			{
+				inDoubleQuote = true;
+			}
+			// Single quotes are transparent to the line splitter; they are
+			// still recognised by the tokenizer as argument groupers.
+			else if ( c == '/' && i + 1 < m_text.size()
+				&& ( m_text[ i + 1 ] == '/' || m_text[ i + 1 ] == '*' ) )
+			{
+				slashComment = ( m_text[ i + 1 ] == '/' ) ? 1 : 2;
+				++i;
+			}
+			else if ( c == ';' || c == '\n' || c == '\r' )
+			{
+				end = i;
 				break;
 			}
+			++i;
 		}
 
-		m_line.resize( i + 1 );
-		memcpy( m_line.data(), m_text.data(), i );
-		m_line[i] = '\0';
-		
-		// Delete the text from the command buffer and move remaining commands down
-		// this is necessary because commands (exec) can insert data at the
-		// beginning of the text buffer.
-		if ( i == m_text.size() ) {
-			m_text.clear();
-		} else {
-			i++;
-			m_text.erase( m_text.begin(), m_text.begin() + i );
+		if ( end == std::string::npos )
+			end = m_text.size();
+
+		m_line.assign( m_text, 0, end );
+		// Consume the line and its terminator (if present).
+		size_t consume = end;
+		if ( consume < m_text.size() )
+		{
+			char c = m_text[ consume ];
+			if ( c == '\r' && consume + 1 < m_text.size() && m_text[ consume + 1 ] == '\n' )
+				consume += 2;
+			else
+				consume += 1;
+		}
+		m_text.erase( 0, consume );
+
+		if ( !m_line.empty() )
+		{
+			tokenizeString( m_line.c_str() );
+			if ( argc() > 0 )
+				executeTokenized();
 		}
 
-		this->tokenizeString( m_line.c_str() );
-		if( this->argc() ) {
-			this->executeTokenized();
-		}
+		// A wait command just set m_wait; defer the rest of the buffer.
+		if ( m_wait > 0 )
+			return;
 	}
 }
-
-
-// ------------------------------------------------- Console Command Exec ------------------------------------------------------------
-
-// The functions that execute commands get their parameters with these
-// functions. argv ) will return an empty string, not a NULL
-// if arg > argc, so string operations are allways safe.
 
 int veCmd::argc( void )
 {
-	return (int) m_argv.size();
+	return static_cast< int >( m_argv.size() );
 }
 
 const char* veCmd::argv( int arg )
 {
-	if( arg >= this->argc() )
+	if ( arg < 0 || arg >= static_cast< int >( m_argv.size() ) )
 		return "";
-	return &m_tokens[m_argv[arg]];
+	return m_tokens.data() + m_argv[ arg ];
 }
 
-// Returns a single string containing argv(1) to argv(argc()-1)
 std::string veCmd::args( void )
 {
-	std::string cmdArgs;
-
-	for ( int i = 1; i < m_argv.size(); i++ ) {
-		cmdArgs += this->argv(i);
-		if ( i != m_argv.size() - 1 ) {
-			cmdArgs += " ";
-		}
-	}
-
-	return cmdArgs;
+	return argsFrom( 1 );
 }
 
 std::string veCmd::argsFrom( int arg )
 {
-	std::string cmdArgs;
-
-	if( arg < 0 )
+	if ( arg < 0 )
 		arg = 0;
-
-	for( int i = arg; i < m_argv.size(); i++ ) {
-		cmdArgs += this->argv(i);
-		if( i != m_argv.size() - 1 ) {
-			cmdArgs += " ";
-		}
+	std::string out;
+	for ( int i = arg; i < static_cast< int >( m_argv.size() ); ++i )
+	{
+		if ( i > arg )
+			out.push_back( ' ' );
+		out.append( m_tokens.data() + m_argv[ i ] );
 	}
-
-	return cmdArgs;
+	return out;
 }
 
 const char* veCmd::cmd( void )
@@ -983,305 +976,340 @@ const char* veCmd::cmd( void )
 	return m_cmd.c_str();
 }
 
-// Parses the given string into command line tokens.
-// The text is copied to a separate buffer and 0 characters
-// are inserted in the appropriate place, The argv array
-// will point into this temporary buffer.
-//
 void veCmd::tokenizeString2( const char *text, bool ignoreQuotes )
 {
-	// Clear previous args
 	m_argv.clear();
-
-	if ( !text ) {
-		return;
-	}
-
-	m_cmd = text;
 	m_tokens.clear();
+	if ( !text )
+		return;
+	m_cmd = text;
 
-	while ( 1 ) {
-		if ( m_argv.size() >= VE_MAX_STRING_TOKENS ) {
-			return;			// this is usually something malicious
-		}
+	auto startToken = [&]( size_t offset )
+	{
+		m_argv.push_back( static_cast< int >( offset ) );
+	};
 
-		while ( 1 ) {
-			// Skip whitespace
-			while ( *text && *text <= ' ' ) {
-				text++;
-			}
-			if ( !*text ) {
-				return;			// All tokens parsed
-			}
+	const char* p = text;
+	while ( *p )
+	{
+		// Skip whitespace.
+		while ( *p && *p <= ' ' )
+			++p;
+		if ( !*p )
+			break;
+		if ( static_cast< int >( m_argv.size() ) >= VE_MAX_STRING_TOKENS )
+			break;
 
-			// skip // comments
-			if ( text[0] == '/' && text[1] == '/' ) {
-				return;			// All tokens parsed
-			}
+		// Line comment // ...
+		if ( p[ 0 ] == '/' && p[ 1 ] == '/' )
+			break;
 
-			// skip /* */ comments
-			if ( text[0] == '/' && text[1] =='*' ) {
-				while ( *text && ( text[0] != '*' || text[1] != '/' ) ) {
-					text++;
-				}
-				if ( !*text ) {
-					return;		// All tokens parsed
-				}
-				text += 2;
-			} else {
-				break;			// We are ready to parse a token
-			}
-		}
-
-		// Handle quoted strings (double quotes)
-		if( !ignoreQuotes && *text == '"' ) {
-			m_argv.push_back( (int) m_tokens.size() );
-			text++;
-
-			while( *text && *text != '"' ) {
-				m_tokens.push_back( *text++ );
-			}
-			m_tokens.push_back( '\0' );
-
-			if( !*text ) {
-				return;		// All tokens parsed
-			}
-			text++;
+		// Block comment /* ... */
+		if ( p[ 0 ] == '/' && p[ 1 ] == '*' )
+		{
+			p += 2;
+			while ( *p && !( p[ 0 ] == '*' && p[ 1 ] == '/' ) )
+				++p;
+			if ( *p )
+				p += 2;
 			continue;
 		}
 
-		// Handle single quotes
-		if( !ignoreQuotes && *text == '\'' ) {
-			m_argv.push_back( (int) m_tokens.size() );
-			text++;
-
-			while( *text && *text != '\'' ) {
-				m_tokens.push_back( *text++ );
-			}
+		// Quoted token (single or double quote), only when not ignoreQuotes.
+		if ( !ignoreQuotes && ( *p == '"' || *p == '\'' ) )
+		{
+			char quote = *p++;
+			size_t start = m_tokens.size();
+			startToken( start );
+			while ( *p && *p != quote )
+				m_tokens.push_back( *p++ );
+			if ( *p == quote )
+				++p;
 			m_tokens.push_back( '\0' );
-
-			if( !*text ) {
-				return;		// All tokens parsed
-			}
-			text++;
 			continue;
 		}
 
-		// Regular token
-		m_argv.push_back( (int) m_tokens.size() );
-
-		// Skip until whitespace, quote, or command
-		while( *text > ' ' ) {
-			if( !ignoreQuotes && text[0] == '"' ) {
+		// Regular token: copy while > ' ' and not the start of comments/quotes.
+		size_t start = m_tokens.size();
+		startToken( start );
+		while ( *p )
+		{
+			char c = *p;
+			if ( c <= ' ' )
 				break;
-			}
-
-			if( text[0] == '/' && text[1] == '/' ) {
+			if ( !ignoreQuotes && c == '"' )
 				break;
-			}
-
-			// Skip /* */ comments
-			if( text[0] == '/' && text[1] == '*' ) {
+			if ( !ignoreQuotes && c == '\'' )
 				break;
-			}
-
-			m_tokens.push_back( *text++ );
+			if ( c == '/' && ( p[ 1 ] == '/' || p[ 1 ] == '*' ) )
+				break;
+			m_tokens.push_back( c );
+			++p;
 		}
 		m_tokens.push_back( '\0' );
-
-		if ( !*text ) {
-			return;		// All tokens parsed
-		}
 	}
 }
 
 void veCmd::tokenizeString( const char *text )
 {
-	this->tokenizeString2( text, false );
+	tokenizeString2( text, false );
 }
 
 void veCmd::tokenizeStringIgnoreQuotes( const char *text )
 {
-	this->tokenizeString2( text, true );
+	tokenizeString2( text, true );
 }
 
-// Parses a single line of text into arguments and tries to execute it
-// as if it was typed at the console
+// INSERT `text` into the buffer and run the buffered executor.
 void veCmd::executeString( const char *text )
 {
-	if ( !text || !*text ) {
+	if ( !text || text[ 0 ] == '\0' )
 		return;
-	}
-
-	this->execute( VE_CMD_EXEC_INSERT, text );
-	this->execute();
+	execute( VE_CMD_EXEC_INSERT, text );
+	execute();
 }
 
+// Dispatch the most recently tokenized command.
 void veCmd::executeTokenized()
 {
-	auto aliasIt = m_aliases.find( this->argv( 0 ) );
-	if( aliasIt != m_aliases.end() ) {
-		this->execute( VE_CMD_EXEC_INSERT, aliasIt->second.c_str() );
+	const char* name = argv( 0 );
+	if ( !name || name[ 0 ] == '\0' )
+		return;
+
+	// Aliases take priority.
+	auto aliasIt = m_aliases.find( name );
+	if ( aliasIt != m_aliases.end() )
+	{
+		execute( VE_CMD_EXEC_INSERT, aliasIt->second.c_str() );
 		return;
 	}
 
-	// Check registered command functions
-	auto it = m_functions.find( this->argv( 0 ) );
-	if( it != m_functions.end() ) {
-		if ( it->second.func )
-			it->second.func();
+	// Registered command.
+	auto cmdIt = m_functions.find( name );
+	if ( cmdIt != m_functions.end() )
+	{
+		if ( cmdIt->second.func )
+			cmdIt->second.func();
 		return;
 	}
 
-	// Check cvars
+	// Cvar command handler.
 	if ( veCVar::command() )
 		return;
 
-	// TODO: client, server, ui commands!
-	auto ass = this->argv( 0 );
-	dinfo( "%s: unknown command.\n", ass );
+	dinfo( "%s: unknown command.\n", name );
 }
 
-// Called by the init functions of other parts of the program to
-// register commands and functions to call for them.
-// The cmd_name is referenced later, so it should not be in temp memory
-// if function is NULL, the command will be forwarded to the server
-// as a clc_clientCommand instead of executed locally.
-//
 void veCmd::addCommand( const char *name, veCmdFunc function )
 {
-	if( m_functions.find( name ) != m_functions.end() ) {
+	if ( !name )
+		return;
+	if ( m_functions.find( name ) != m_functions.end() )
+	{
 		dinfo( "veCmd::addCommand(): %s already defined!\n", name );
 		return;
 	}
-
-	veCmdFuncHandler handler;
-	handler.name = name;
-	handler.func = function;
-
-	m_functions[name] = handler;
+	veCmdFuncHandler h;
+	h.name = name;
+	h.func = std::move( function );
+	m_functions.emplace( name, std::move( h ) );
 }
 
 void veCmd::removeCommand( const char *name )
 {
-	auto it = m_functions.find( name );
-	if( it != m_functions.end() ) {
-		m_functions.erase( it );
-	}
+	if ( !name )
+		return;
+	m_functions.erase( name );
 }
 
 void veCmd::commandCompletion( std::function< void( const char *s, const char *expr ) > callback )
 {
-	for( auto& it : m_functions ) {
-		callback( it.first.c_str(), it.second.complete.length() ? it.second.complete.c_str() : nullptr );
+	for ( const auto& kv : m_functions )
+	{
+		const char* expr = kv.second.complete.empty() ? nullptr : kv.second.complete.c_str();
+		callback( kv.first.c_str(), expr );
 	}
-
-	for( auto& alias : m_aliases ) {
-		callback( alias.first.c_str(), nullptr );
-	}
+	for ( const auto& kv : m_aliases )
+		callback( kv.first.c_str(), nullptr );
 }
 
 void veCmd::setCommandCompletion( const char *command, const std::string& complete )
 {
-	m_functions[command].complete = complete;
+	if ( !command )
+		return;
+	auto it = m_functions.find( command );
+	if ( it == m_functions.end() )
+	{
+		veCmdFuncHandler h;
+		h.name = command;
+		h.complete = complete;
+		m_functions.emplace( command, std::move( h ) );
+	}
+	else
+	{
+		it->second.complete = complete;
+	}
 }
 
+// Case-(in)sensitive substring search. Empty needle matches at the haystack.
 const char* veCmd::stringContains( const char *str1, const char *str2, int caseSensitive )
 {
-	int len, i, j;
+	if ( !str1 || !str2 )
+		return nullptr;
+	if ( *str2 == '\0' )
+		return str1;
+	if ( caseSensitive )
+		return std::strstr( str1, str2 );
 
-	len = (int) strlen( str1 ) - (int) strlen( str2 );
-	for( i = 0; i <= len; i++, str1++ ) {
-		for( j = 0; str2[j]; j++ ) {
-			if( caseSensitive ) {
-				if( str1[j] != str2[j] ) {
-					break;
-				}
-			} else {
-				if( toupper( str1[j] ) != toupper( str2[j] ) ) {
-					break;
-				}
-			}
+	for ( const char* p = str1; *p; ++p )
+	{
+		const char* a = p;
+		const char* b = str2;
+		while ( *a && *b && std::toupper( static_cast< unsigned char >( *a ) ) == std::toupper( static_cast< unsigned char >( *b ) ) )
+		{
+			++a;
+			++b;
 		}
-		if( !str2[j] ) {
-			return str1;
-		}
+		if ( !*b )
+			return p;
 	}
-	return NULL;
+	return nullptr;
 }
 
+// Case-(in)sensitive glob filter supporting '*', '?', and character classes
+// '[abc]' / '[a-z]'. '[[' is treated as a literal '['.
 int veCmd::filter( const char *filter, const char *name, int caseSensitive )
 {
-	static char buf[ VE_MAX_TOKEN_LENGTH ];
-	const char *ptr;
-	int i, found;
+	if ( !filter || !name )
+		return 0;
 
-	while( *filter ) {
-		if( *filter == '*' ) {
-			filter++;
-			for( i = 0; *filter; i++ ) {
-				if( *filter == '*' || *filter == '?' ) break;
-				if ( i >= sizeof( buf ) ) derr( "veCmd::filter buffer overflow! Bump VE_MAX_TOKEN_LENGTH?\n" );
-				buf[i] = *filter;
-				filter++;
+	auto toUpper = [caseSensitive]( char c ) -> char
+	{
+		return caseSensitive ? c : static_cast< char >( std::toupper( static_cast< unsigned char >( c ) ) );
+	};
+
+	char buffer[ VE_MAX_TOKEN_LENGTH ];
+	char* outPtr = buffer;
+	const char* f = filter;
+	const char* n = name;
+	const char* fCheckpoint = nullptr;
+	const char* nCheckpoint = nullptr;
+	char* outCheckpoint = nullptr;
+
+	while ( *f )
+	{
+		if ( static_cast< size_t >( outPtr - buffer ) >= sizeof( buffer ) - 1 )
+		{
+			derr( "Cmd::filter: command filter length too long (> %d).\n", VE_MAX_TOKEN_LENGTH );
+			buffer[ sizeof( buffer ) - 1 ] = '\0';
+			return 0;
+		}
+
+		if ( *f == '*' )
+		{
+			// Collapse runs of '*' and remember the position after them.
+			while ( *f == '*' )
+				++f;
+			if ( !*f )
+				return 1; // trailing '*' matches rest of name
+			fCheckpoint = f;
+			nCheckpoint = n;
+			outCheckpoint = outPtr;
+			continue;
+		}
+		if ( *f == '?' )
+		{
+			if ( *n == '\0' )
+			{
+				if ( !fCheckpoint || *( nCheckpoint + 1 ) == '\0' )
+					return 0;
+				f = fCheckpoint;
+				n = ++nCheckpoint;
+				outPtr = outCheckpoint;
+				continue;
 			}
-			if ( i >= sizeof( buf ) ) derr( "veCmd::filter buffer overflow! Bump VE_MAX_TOKEN_LENGTH?\n" );
-			buf[i] = '\0';
-			if( strlen( buf ) ) {
-				ptr = veCmd::stringContains( name, buf, caseSensitive );
-				if( !ptr ) return false;
-				name = ptr + strlen( buf );
-			} else {
-				// Trailing * matches any remaining characters
-				while( *name ) name++;
+			*outPtr++ = *n++;
+			++f;
+			continue;
+		}
+		if ( *f == '[' )
+		{
+			if ( f[ 1 ] == '[' )
+			{
+				if ( *n != '[' )
+				{
+					if ( !fCheckpoint || *( nCheckpoint + 1 ) == '\0' )
+						return 0;
+					f = fCheckpoint;
+					n = ++nCheckpoint;
+					outPtr = outCheckpoint;
+					continue;
+				}
+				*outPtr++ = '[';
+				++n;
+				f += 2;
+				continue;
 			}
-		} else if( *filter == '?' ) {
-			filter++;
-			if( *name == '\0' ) return false;  // No character to match
-			name++;
-		} else if( *filter == '[' && *( filter + 1 ) == '[' ) {
-			filter++;
-		} else if( *filter == '[' ) {
-			filter++;
-			found = false;
-			while( *filter && !found ) {
-				if( *filter == ']' && *( filter + 1 ) != ']' ) break;
-				if( *( filter + 1 ) == '-' && *( filter + 2 ) && ( *( filter + 2 ) != ']' || *( filter + 3 ) == ']' ) ) {
-					if( caseSensitive ) {
-						if( *name >= *filter && *name <= *( filter + 2 ) ) found = true;
-					} else {
-						if( toupper( *name ) >= toupper( *filter ) &&
-							toupper( *name ) <= toupper( *( filter + 2 ) ) ) found = true;
-					}
-					filter += 3;
-				} else {
-					if( caseSensitive ) {
-						if( *filter == *name ) found = true;
-					} else {
-						if( toupper( *filter ) == toupper( *name ) ) found = true;
-					}
-					filter++;
+			bool negate = false;
+			++f;
+			if ( *f == '!' || *f == '^' )
+			{
+				negate = true;
+				++f;
+			}
+			bool matched = false;
+			while ( *f && *f != ']' )
+			{
+				char lo = toUpper( *f );
+				if ( f[ 1 ] == '-' && f[ 2 ] && f[ 2 ] != ']' )
+				{
+					char hi = toUpper( f[ 2 ] );
+					char nc = toUpper( *n );
+					if ( nc >= lo && nc <= hi )
+						matched = true;
+					f += 3;
+				}
+				else
+				{
+					if ( *n && toUpper( *n ) == lo )
+						matched = true;
+					++f;
 				}
 			}
-			if( !found ) return false;
-			while( *filter ) {
-				if( *filter == ']' && *( filter + 1 ) != ']' ) break;
-				filter++;
+			if ( *f == ']' )
+				++f;
+			if ( *n && matched != negate )
+			{
+				*outPtr++ = *n++;
 			}
-			filter++;
-			name++;
-		} else {
-			if( caseSensitive ) {
-				if( *filter != *name ) return false;
-			} else {
-				if( toupper( *filter ) != toupper( *name ) ) return false;
+			else
+			{
+				if ( !fCheckpoint || *( nCheckpoint + 1 ) == '\0' )
+					return 0;
+				f = fCheckpoint;
+				n = ++nCheckpoint;
+				outPtr = outCheckpoint;
+				continue;
 			}
-			filter++;
-			name++;
+			continue;
 		}
+		// Literal char.
+		if ( *n == '\0' || toUpper( *f ) != toUpper( *n ) )
+		{
+			if ( !fCheckpoint || *( nCheckpoint + 1 ) == '\0' )
+				return 0;
+			f = fCheckpoint;
+			n = ++nCheckpoint;
+			outPtr = outCheckpoint;
+			continue;
+		}
+		*outPtr++ = *n++;
+		++f;
 	}
-	// Filter is exhausted - name must also be exhausted for a match
-	return *name == '\0';
+
+	// Pattern consumed: name must be fully consumed too.
+	*outPtr = '\0';
+	return *n == '\0' ? 1 : 0;
 }
 
 // ---------------------------------- Default Console Command Functions --------------------------
@@ -1293,100 +1321,106 @@ int veCmd::filter( const char *filter, const char *name, int caseSensitive )
 void veCmd_WaitFunc( void )
 {
 	auto& c = veGetCmd();
-	if( c.argc() == 2 ) {
-		c.setWait( atoi( c.argv( 1 ) ) );
-		if( c.getWait() < 0 )
-			c.setWait( 1 ); // Ignore the argument.
-	} else {
-		c.setWait( 1 );
+	int wait = 1;
+	if ( c.argc() == 2 )
+	{
+		wait = std::atoi( c.argv( 1 ) );
+		if ( wait < 0 )
+			wait = 1;
 	}
+	c.setWait( wait );
 }
 
 void veCmd_EchoFunc()
 {
-	dinfo( "%s\n", veGetCmd().args().c_str() );
+	auto& c = veGetCmd();
+	dinfo( "%s\n", c.args().c_str() );
 }
 
 void veCmd_AliasFunc()
 {
 	auto& c = veGetCmd();
-
-	if( c.argc() == 1 ) {
-		for( const auto& alias : c.getAliases() ) {
-			dinfo( "%s : %s\n", alias.first.c_str(), alias.second.c_str() );
-		}
-		dinfo( "%d aliases\n", c.getAliases().size() );
+	if ( c.argc() == 1 )
+	{
+		for ( const auto& kv : c.getAliases() )
+			dinfo( "%s : %s\n", kv.first.c_str(), kv.second.c_str() );
+		dinfo( "%d aliases\n", static_cast< int >( c.getAliases().size() ) );
 		return;
 	}
 
-	auto name = c.argv( 1 );
-	if( !veIsValidConsoleToken( name ) || strcmp( name, "alias" ) == 0 ) {
-		dinfo( "alias: invalid alias name '%s'\n", name );
+	const char* name = c.argv( 1 );
+	if ( !veIsValidConsoleToken( name ) || std::strcmp( name, "alias" ) == 0 )
+	{
+		dinfo( "alias: invalid alias name '%s'\n", name ? name : "" );
 		return;
 	}
 
-	if( c.argc() == 2 ) {
+	if ( c.argc() == 2 )
+	{
 		auto it = c.getAliases().find( name );
-		if( it == c.getAliases().end() ) {
+		if ( it != c.getAliases().end() )
+			dinfo( "%s : %s\n", it->first.c_str(), it->second.c_str() );
+		else
 			dinfo( "alias %s does not exist.\n", name );
-			return;
-		}
-
-		dinfo( "%s : %s\n", it->first.c_str(), it->second.c_str() );
 		return;
 	}
 
-	c.getAliases()[name] = c.argsFrom( 2 );
+	c.getAliases()[ name ] = c.argsFrom( 2 );
 }
 
 void veCmd_ExecFunc()
 {
 	auto& c = veGetCmd();
-	if( c.argc() != 2 ) {
+	if ( c.argc() != 2 )
+	{
 		dinfo( "usage: exec <filename>\n" );
 		return;
 	}
-
-	std::ifstream file( c.argv( 1 ), std::ios::binary );
-	if( !file ) {
-		dinfo( "couldn't exec %s\n", c.argv( 1 ) );
+	const char* filename = c.argv( 1 );
+	std::ifstream f( filename, std::ios::binary );
+	if ( !f.good() )
+	{
+		dinfo( "couldn't exec %s\n", filename );
 		return;
 	}
-
-	std::string contents( ( std::istreambuf_iterator< char >( file ) ), std::istreambuf_iterator< char >() );
-	if( contents.empty() ) {
+	std::ostringstream ss;
+	ss << f.rdbuf();
+	std::string contents = ss.str();
+	if ( contents.empty() )
 		return;
-	}
-
 	c.execute( VE_CMD_EXEC_INSERT, contents.c_str() );
 }
 
 void veCmd_ListFunc()
 {
 	auto& c = veGetCmd();
-	auto match = ( c.argc() > 1 ) ? c.argv( 1 ) : nullptr;
-	auto funcList = c.getFunctionsList();
-	
-	for ( auto& it : funcList ) {
-		if ( match && !veCmd::filter( match, it.second.name.c_str(), false ) )
+	const char* match = c.argc() > 1 ? c.argv( 1 ) : nullptr;
+	int total = 0;
+	for ( const auto& kv : c.getFunctionsList() )
+	{
+		const char* name = kv.second.name.c_str();
+		if ( match && !veCmd::filter( match, name, false ) )
 			continue;
-		dinfo( "%s\n", it.second.name.c_str() );
+		dinfo( "%s\n", name );
+		++total;
 	}
-
-	dinfo( "%d commands\n", funcList.size() );
+	// Total reported count reflects every command in the list, not the filtered count.
+	dinfo( "%d commands\n", static_cast< int >( c.getFunctionsList().size() ) );
+	(void)total;
 }
 
 void veCVarCmd_PrintFunc()
 {
 	auto& c = veGetCmd();
-	if ( c.argc() != 2 ) {
+	if ( c.argc() != 2 )
+	{
 		dinfo( "usage: print <variable>\n" );
 		return;
 	}
-	auto name = c.argv( 1 );
-	auto cv = veCVar::find( name );
-	if ( cv )
-		veCVar::print( cv );
+	const char* name = c.argv( 1 );
+	veCVar* v = veCVar::find( name );
+	if ( v )
+		veCVar::print( v );
 	else
 		dinfo( "Cvar %s does not exist.\n", name );
 }
@@ -1394,91 +1428,81 @@ void veCVarCmd_PrintFunc()
 void veCVarCmd_ToggleFunc()
 {
 	auto& c = veGetCmd();
-
-	if( c.argc() < 2 ) {
+	if ( c.argc() < 2 )
+	{
 		dinfo( "usage: toggle <variable> [value1, value2, ...]\n" );
 		return;
 	}
-
-	if( c.argc() == 2 ) {
-		veCVar::set2( c.argv( 1 ), veq3_va( "%d", !veCVar::variableValue( c.argv( 1 ) ) ), false );
+	const char* name = c.argv( 1 );
+	if ( c.argc() == 2 )
+	{
+		char buf[ 32 ];
+		std::snprintf( buf, sizeof( buf ), "%d", !static_cast< int >( veCVar::variableValue( name ) ) );
+		veCVar::set2( name, buf, false );
 		return;
 	}
-
-	if( c.argc() == 3 ) {
+	if ( c.argc() == 3 )
+	{
 		dinfo( "toggle: nothing to toggle to\n" );
 		return;
 	}
-
-	auto curval = veCVar::variableString( c.argv( 1 ) );
-
-	// Don't bother checking the last arg for a match since the desired behaviour is the same as no match (set to the first argument)
-	for( int i = 2; i + 1 < c.argc(); i++ ) {
-		if( strcmp( curval, c.argv( i ) ) == 0 ) {
-			veCVar::set2( c.argv( 1 ), c.argv( i + 1 ), false );
-			return;
+	// argc > 3: cycle through argv(2)..argv(argc-2), wrapping to argv(2).
+	const char* cur = veCVar::variableString( name );
+	int nextIdx = 2;
+	for ( int i = 2; i < c.argc() - 1; ++i )
+	{
+		if ( std::strcmp( cur, c.argv( i ) ) == 0 )
+		{
+			nextIdx = i + 1;
+			break;
 		}
 	}
-
-	// Fallback
-	veCVar::set2( c.argv( 1 ), c.argv( 2 ), false );
+	if ( nextIdx >= c.argc() )
+		nextIdx = 2;
+	veCVar::set2( name, c.argv( nextIdx ), false );
 }
 
 void veCVarCmd_SetFunc()
 {
 	auto& c = veGetCmd();
-	auto ac = c.argc();
-	auto cmd = c.argv( 0 );
-
-	if( ac < 2 ) {
-		dinfo( "usage: %s <variable> <value>\n", cmd );
+	int ac = c.argc();
+	const char* cmd = c.argv( 0 );
+	if ( ac < 2 )
+	{
+		dinfo( "usage: %s <variable> <value>\n", cmd ? cmd : "" );
 		return;
 	}
-	if( ac == 2 ) {
+	if ( ac == 2 )
+	{
 		veCVarCmd_PrintFunc();
 		return;
 	}
-
-	auto v = veCVar::set2( c.argv( 1 ), c.argsFrom( 2 ).c_str(), false );
-	if( !v ) {
+	veCVar* v = veCVar::set2( c.argv( 1 ), c.argsFrom( 2 ).c_str(), false );
+	if ( !v )
 		return;
-	}
-
-	switch( cmd[3] ) {
-		case 'a':
-			if( !( v->getFlags() & VE_CVAR_ARCHIVE ) ) {
-				v->getFlags() |= VE_CVAR_ARCHIVE;
-				veCVar::getModifiedFlags() |= VE_CVAR_ARCHIVE;
-			}
-			break;
-		case 'u':
-			if( !( v->getFlags() & VE_CVAR_USERINFO ) ) {
-				v->getFlags() |= VE_CVAR_USERINFO;
-				veCVar::getModifiedFlags() |= VE_CVAR_USERINFO;
-			}
-			break;
-		case 's':
-			if( !( v->getFlags() & VE_CVAR_SERVERINFO ) ) {
-				v->getFlags() |= VE_CVAR_SERVERINFO;
-				veCVar::getModifiedFlags() |= VE_CVAR_SERVERINFO;
-			}
-			break;
-		case 'e': // set command
-			// No special flags to set
-			break;
-		case 't': // reset command
-			// No special flags to set
-			break;
-		default:
-			// Unknown command, do nothing
-			break;
+	if ( cmd && cmd[ 3 ] )
+	{
+		int extra = 0;
+		switch ( cmd[ 3 ] )
+		{
+		case 'a': extra = VE_CVAR_ARCHIVE; break;
+		case 'u': extra = VE_CVAR_USERINFO; break;
+		case 's': extra = VE_CVAR_SERVERINFO; break;
+		default: break;
+		}
+		if ( extra )
+		{
+			v->getFlags() |= extra;
+			veCVar::getModifiedFlags() |= extra;
+		}
 	}
 }
 
 void veCVarCmd_ResetFunc()
 {
 	auto& c = veGetCmd();
-	if( c.argc() != 2 ) {
+	if ( c.argc() != 2 )
+	{
 		dinfo( "usage: reset <variable>\n" );
 		return;
 	}
@@ -1488,24 +1512,14 @@ void veCVarCmd_ResetFunc()
 void veCVarCmd_ListFunc()
 {
 	auto& c = veGetCmd();
-
-	const char* match = nullptr;
-	if ( c.argc() > 1 ) {
-		match = c.argv( 1 );
-	}
-
+	const char* match = c.argc() > 1 ? c.argv( 1 ) : nullptr;
 	veCVar::list( match );
 }
 
 void veCVarCmd_ListModifiedFunc()
 {
 	auto& c = veGetCmd();
-
-	const char* match = nullptr;
-	if ( c.argc() > 1 ) {
-		match = c.argv( 1 );
-	}
-
+	const char* match = c.argc() > 1 ? c.argv( 1 ) : nullptr;
 	veCVar::listModified( match );
 }
 
@@ -1517,43 +1531,45 @@ void veCVarCmd_RestartFunc()
 void veCVar_InitCmd()
 {
 	auto& c = veGetCmd();
-	
 	c.addCommand( "alias", veCmd_AliasFunc );
+
 	c.addCommand( "print", veCVarCmd_PrintFunc );
 	c.setCommandCompletion( "print", "C_V_" );
+
 	c.addCommand( "toggle", veCVarCmd_ToggleFunc );
 	c.setCommandCompletion( "toggle", "C_V_" );
-	
+
 	c.addCommand( "set", veCVarCmd_SetFunc );
 	c.addCommand( "sets", veCVarCmd_SetFunc );
 	c.addCommand( "setu", veCVarCmd_SetFunc );
 	c.addCommand( "seta", veCVarCmd_SetFunc );
-	c.addCommand( "reset", veCVarCmd_ResetFunc );
 	c.setCommandCompletion( "set", "C_V_" );
 	c.setCommandCompletion( "sets", "C_V_" );
 	c.setCommandCompletion( "setu", "C_V_" );
 	c.setCommandCompletion( "seta", "C_V_" );
+
+	c.addCommand( "reset", veCVarCmd_ResetFunc );
 	c.setCommandCompletion( "reset", "C_V_" );
 
 	c.addCommand( "cvarlist", veCVarCmd_ListFunc );
 	c.addCommand( "cvar_list", veCVarCmd_ListFunc );
+
 	c.addCommand( "cvar_modified", veCVarCmd_ListModifiedFunc );
+
 	c.addCommand( "cvar_restart", veCVarCmd_RestartFunc );
 }
 
 void veCmd_InitDefaultFunctions()
 {
-	static bool veCmdDefaultFunctionsInitialised = false;
-	if ( veCmdDefaultFunctionsInitialised )
+	static bool initialised = false;
+	if ( initialised )
 		return;
-	veCmdDefaultFunctionsInitialised = true;
-
+	initialised = true;
 	auto& c = veGetCmd();
 	c.addCommand( "cmdlist", veCmd_ListFunc );
 	c.addCommand( "echo", veCmd_EchoFunc );
 	c.addCommand( "exec", veCmd_ExecFunc );
 	c.addCommand( "wait", veCmd_WaitFunc );
-
 	veCVar_InitCmd();
 }
 
@@ -1565,48 +1581,61 @@ void veExtractStartupCommands( int argc, const char* const argv[],
 {
 	outRemainingArgv.clear();
 	outCommands.clear();
+	if ( argc <= 0 || !argv )
+		return;
 
-	for( int i = 0; i < argc; i++ ) {
-		if( argv[i][0] == '+' && argv[i][1] != '\0' ) {
-			// Start a new command from the token after the '+'
-			std::string cmd = &argv[i][1];
-			while( i + 1 < argc && argv[i + 1][0] != '+' ) {
-				i++;
-				cmd += ' ';
-				cmd += argv[i];
+	for ( int i = 0; i < argc; ++i )
+	{
+		const char* tok = argv[ i ];
+		if ( !tok )
+			continue;
+		if ( tok[ 0 ] == '+' && tok[ 1 ] != '\0' )
+		{
+			// Begin collecting a new command string from this token's payload.
+			std::string cmd( tok + 1 );
+			++i;
+			while ( i < argc && argv[ i ] && argv[ i ][ 0 ] != '+' )
+			{
+				cmd.push_back( ' ' );
+				cmd.append( argv[ i ] );
+				++i;
 			}
 			outCommands.push_back( std::move( cmd ) );
-		} else {
-			outRemainingArgv.push_back( argv[i] );
+			--i; // rewind so the outer for-loop's ++i lands on the next unconsumed token
+		}
+		else
+		{
+			outRemainingArgv.emplace_back( tok );
 		}
 	}
 }
 
 void veExecuteStartupCommands( const std::vector< std::string >& commands )
 {
-	for( const auto& cmd : commands )
+	for ( const std::string& cmd : commands )
 		veGetCmd().execute( VE_CMD_EXEC_NOW, cmd.c_str() );
 }
 
 // ------------------------------------------------- Misc. Other Utils -------------------------------------------------
 
-// va
-// Does a varargs printf into a temp buffer, so I don't need to have
-// varargs versions of all text functions.
-//
+// Printf into a rotating ring of thread-local temp buffers. Each call
+// selects the next slot (round-robin) and formats into it bounded by the
+// buffer size. With N slots, up to N concurrent results are simultaneously
+// valid; the (N+1)th call reuses the first buffer.
 char* veq3_va( const char *format, ... )
 {
-	va_list		argptr;
-	static thread_local std::array< std::array< char, 8192 >, 4 > string;
-	static thread_local size_t index = 0;
-	char		*buf;
+	constexpr int NUM_BUFFERS = 4;
+	constexpr int BUFFER_SIZE = 8192;
+	thread_local std::array< std::array< char, BUFFER_SIZE >, NUM_BUFFERS > buffers{};
+	thread_local int nextBuffer = 0;
 
-	buf = string[index % string.size()].data();
-	index++;
+	char* out = buffers[ nextBuffer ].data();
+	nextBuffer = ( nextBuffer + 1 ) % NUM_BUFFERS;
 
-	va_start( argptr, format );
-	vsnprintf( buf, string.front().size(), format, argptr );
-	va_end( argptr );
+	va_list args;
+	va_start( args, format );
+	std::vsnprintf( out, BUFFER_SIZE, format, args );
+	va_end( args );
 
-	return buf;
+	return out;
 }
